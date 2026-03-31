@@ -18,7 +18,6 @@ const DEFAULT_PAGE = 1;
 const MAX_COUNT = 60;
 const TMDB_PAGE_SIZE = 20;
 const MAX_SOURCE_PAGES = 5;
-const MAX_PROGRESSIVE_SOURCE_PAGES = 30;
 const CACHE_MAX_BYTES = 500 * 1024 * 1024;
 const CACHE_NAMESPACE_TMDB = 'cache:tmdb';
 const CACHE_NAMESPACE_TRANSLATE = 'cache:translate';
@@ -27,10 +26,12 @@ const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
 const TRANSLATION_BATCH_SIZE = 20;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
-const TRANSLATION_PROMPT_VERSION = 'v4';
+const TRANSLATION_INTER_BATCH_DELAY_MS = 350;
+const TRANSLATION_MAX_ATTEMPTS = 2;
+const TRANSLATION_PROMPT_VERSION = 'v5';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
-  default: 5,
-  rating: 20,
+  default: 1,
+  rating: 5,
 });
 const TMDB_WEB_BASE = 'https://www.themoviedb.org';
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
@@ -67,16 +68,16 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_MODEL,
     title: '翻译模型名',
     type: 'input',
-    value: 'Qwen/Qwen2.5-7B-Instruct',
+    value: 'Qwen/Qwen3.5-4B',
     description: '例如 gpt-4.1-mini、qwen-plus、deepseek-chat',
     placeholders: [
       {
-        title: 'Qwen/Qwen2.5-7B-Instruct',
-        value: 'Qwen/Qwen2.5-7B-Instruct',
-      },
-      {
         title: 'Qwen/Qwen3.5-4B',
         value: 'Qwen/Qwen3.5-4B',
+      },
+      {
+        title: 'Qwen/Qwen2.5-7B-Instruct',
+        value: 'Qwen/Qwen2.5-7B-Instruct',
       },
       {
         title: 'deepseek-chat',
@@ -504,6 +505,16 @@ function normalizeUrl(value) {
   return normalizeTitle(value).replace(/\/+$/, '');
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildTranslationSystemPrompt({ strict = false } = {}) {
+  return strict
+    ? '你是影视标题翻译器。请把输入标题统一转换为简体中文片名/剧名。若没有官方中译名，也必须按常见译法或音译生成中文，不要保留英文、法文、西语、日语罗马字等拉丁字母原文。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。'
+    : '你是影视标题翻译器。请只把输入标题翻译成简体中文片名/剧名。若标题是人名、地名或专有名词，请给出简体中文音译，不要直接保留外文原文。只输出 JSON，对象中只能包含 translations 数组。';
+}
+
 function stableStringify(value) {
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(',')}]`;
@@ -637,7 +648,23 @@ function shouldPersistTranslatedTitle(originalTitle, translatedTitle) {
     return false;
   }
 
+  if (
+    (!containsHan(normalizedOriginalTitle) || containsNonChineseScript(normalizedOriginalTitle))
+    && !containsHan(normalizedTranslatedTitle)
+  ) {
+    return false;
+  }
+
   return true;
+}
+
+function isRetryableTranslationError(error) {
+  const message = normalizeTitle(error?.message ?? String(error ?? ''));
+  if (!message) {
+    return false;
+  }
+
+  return /(?:429|502|503|504|busy|timeout|timed out|超时|暂时|稍后|频繁)/i.test(message);
 }
 
 function getTodayDateString() {
@@ -698,6 +725,11 @@ function isTranslationProxyMode(config) {
 function isUsableTmdbChineseTitle(title) {
   const normalizedTitle = normalizeTitle(title);
   return Boolean(normalizedTitle && containsHan(normalizedTitle) && !containsNonChineseScript(normalizedTitle));
+}
+
+function isUsableTranslatedChineseTitle(title) {
+  const normalizedTitle = normalizeTitle(title);
+  return Boolean(normalizedTitle && containsHan(normalizedTitle));
 }
 
 function getMachineTranslationSourceTitle(record) {
@@ -1187,8 +1219,7 @@ async function requestTranslationBatch(titles, translationConfig, runtime) {
     messages: [
       {
         role: 'system',
-        content:
-          '你是影视标题翻译器。请只把输入标题翻译成简体中文片名/剧名。不要解释，不要扩写，不要保留编号。只输出 JSON，对象中只能包含 translations 数组。',
+        content: buildTranslationSystemPrompt(),
       },
       {
         role: 'user',
@@ -1218,6 +1249,141 @@ async function requestTranslationBatch(titles, translationConfig, runtime) {
   return titles.map((title, index) => normalizeTitle(parsedTranslations[index]) || title);
 }
 
+async function requestStrictTranslationRetry(titles, translationConfig, runtime) {
+  if (!titles.length) {
+    return [];
+  }
+
+  if (isTranslationProxyMode(translationConfig)) {
+    const response = await runtime.httpPost(
+      normalizeUrl(translationConfig.baseUrl),
+      {
+        titles,
+        model: translationConfig.model,
+        strict: true,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+
+    if (Array.isArray(response?.translations)) {
+      return response.translations.map((value) => normalizeTitle(String(value)));
+    }
+
+    throw new Error('翻译代理严格重试返回格式异常');
+  }
+
+  const requestBody = {
+    model: translationConfig.model,
+    temperature: 0.1,
+    max_tokens: 160,
+    response_format: {
+      type: 'json_object',
+    },
+    messages: [
+      {
+        role: 'system',
+        content: buildTranslationSystemPrompt({ strict: true }),
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({ translations: titles }),
+      },
+    ],
+  };
+
+  if (modelSupportsThinkingToggle(translationConfig.model)) {
+    requestBody.enable_thinking = false;
+  }
+
+  const response = await runtime.httpPost(
+    buildOpenAiChatCompletionsUrl(translationConfig.baseUrl),
+    requestBody,
+    {
+      headers: {
+        Authorization: `Bearer ${translationConfig.token}`,
+      },
+      timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
+    },
+  );
+
+  const content = response?.choices?.[0]?.message?.content ?? '';
+  const parsedTranslations = parseTranslationResponseContent(content, titles.length);
+
+  return titles.map((title, index) => normalizeTitle(parsedTranslations[index]) || title);
+}
+
+async function requestTranslationBatchWithBackoff(batch, translationConfig, runtime) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      let translatedBatch = await requestTranslationBatch(batch, translationConfig, runtime);
+      const untranslatedEntries = collectUntranslatedEntries(batch, translatedBatch);
+
+      if (untranslatedEntries.length) {
+        const retriedBatch = await requestStrictTranslationRetry(
+          untranslatedEntries.map((entry) => entry.title),
+          translationConfig,
+          runtime,
+        );
+
+        for (const [retryIndex, unresolvedEntry] of untranslatedEntries.entries()) {
+          const retriedTitle = normalizeTitle(retriedBatch[retryIndex]);
+
+          if (isUsableTranslatedChineseTitle(retriedTitle)) {
+            translatedBatch[unresolvedEntry.index] = retriedTitle;
+          }
+        }
+      }
+
+      return {
+        translatedBatch,
+        requestSucceeded: true,
+      };
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= TRANSLATION_MAX_ATTEMPTS || !isRetryableTranslationError(error)) {
+        break;
+      }
+
+      await sleep(600 * attempt);
+    }
+  }
+
+  return {
+    translatedBatch: batch,
+    requestSucceeded: false,
+    error: lastError,
+  };
+}
+
+function collectUntranslatedEntries(batch, translatedBatch) {
+  return batch
+    .map((title, index) => ({
+      title,
+      translatedTitle: normalizeTitle(translatedBatch[index]) || title,
+      index,
+    }))
+    .filter(({ title, translatedTitle }) => {
+      const normalizedSource = normalizeTitle(title);
+
+      if (!normalizedSource) {
+        return false;
+      }
+
+      if (isUsableTranslatedChineseTitle(translatedTitle)) {
+        return false;
+      }
+
+      return !containsHan(normalizedSource) || containsNonChineseScript(normalizedSource);
+    });
+}
+
 async function translateTitlesWithCache(titles, translationConfig, runtime) {
   if (!hasTranslationConfig(translationConfig) || !titles.length) {
     return new Map();
@@ -1244,28 +1410,14 @@ async function translateTitlesWithCache(titles, translationConfig, runtime) {
     missingTitles.push(title);
   }
 
-  const batchRequests = [];
   for (let index = 0; index < missingTitles.length; index += TRANSLATION_BATCH_SIZE) {
     const batch = missingTitles.slice(index, index + TRANSLATION_BATCH_SIZE);
-    batchRequests.push(
-      (async () => {
-        let translatedBatch = batch;
-        let requestSucceeded = false;
-
-        try {
-          translatedBatch = await requestTranslationBatch(batch, translationConfig, runtime);
-          requestSucceeded = true;
-        } catch {
-          translatedBatch = batch;
-        }
-
-        return { batch, translatedBatch, requestSucceeded };
-      })(),
+    const { translatedBatch, requestSucceeded } = await requestTranslationBatchWithBackoff(
+      batch,
+      translationConfig,
+      runtime,
     );
-  }
 
-  const batchResults = await Promise.all(batchRequests);
-  for (const { batch, translatedBatch, requestSucceeded } of batchResults) {
     for (const [batchIndex, title] of batch.entries()) {
       const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || title;
       translatedMap.set(title, translatedTitle);
@@ -1284,6 +1436,10 @@ async function translateTitlesWithCache(titles, translationConfig, runtime) {
           maxBytes: runtime.cacheMaxBytes,
         }).catch(() => {});
       }
+    }
+
+    if (index + TRANSLATION_BATCH_SIZE < missingTitles.length) {
+      await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
     }
   }
 
@@ -1434,7 +1590,6 @@ function getProgressiveFetchPlan(params) {
 
   return {
     sourceStartPage: 1,
-    sourceEndPage: MAX_PROGRESSIVE_SOURCE_PAGES,
     neededCollectedCount: neededItemCount,
   };
 }
@@ -1645,10 +1800,9 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
         collected.push(record);
       }
 
-      const reachedConfiguredLimit = scope.nextPage >= MAX_PROGRESSIVE_SOURCE_PAGES;
       const reachedRemoteEnd = !results.length || (totalPages > 0 && scope.nextPage >= totalPages);
 
-      if (reachedConfiguredLimit || reachedRemoteEnd) {
+      if (reachedRemoteEnd) {
         scope.exhausted = true;
         continue;
       }
@@ -1676,7 +1830,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.4",
+  version: "0.3.6",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
