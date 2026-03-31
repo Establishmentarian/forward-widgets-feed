@@ -31,7 +31,7 @@ const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
 const TRANSLATION_BATCH_SIZE = 20;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
-const TRANSLATION_PROMPT_VERSION = 'v2';
+const TRANSLATION_PROMPT_VERSION = 'v3';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 5,
   rating: 20,
@@ -635,6 +635,29 @@ function parseTranslationResponseContent(content, expectedCount) {
     .map((line) => normalizeTitle(line))
     .filter(Boolean)
     .slice(0, expectedCount);
+}
+
+function shouldPersistTranslatedTitle(originalTitle, translatedTitle) {
+  if (!isMeaningfulText(translatedTitle)) {
+    return false;
+  }
+
+  const normalizedOriginalTitle = normalizeTitle(originalTitle);
+  const normalizedTranslatedTitle = normalizeTitle(translatedTitle);
+
+  if (!normalizedOriginalTitle) {
+    return false;
+  }
+
+  // 对明显外文原名，如果模型只是原样回传，不能把失败结果长期缓存住。
+  if (
+    normalizedTranslatedTitle === normalizedOriginalTitle
+    && (!containsHan(normalizedOriginalTitle) || containsNonChineseScript(normalizedOriginalTitle))
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function getTodayDateString() {
@@ -1249,9 +1272,11 @@ async function translateTitlesWithCache(titles, translationConfig, runtime) {
   for (let index = 0; index < missingTitles.length; index += TRANSLATION_BATCH_SIZE) {
     const batch = missingTitles.slice(index, index + TRANSLATION_BATCH_SIZE);
     let translatedBatch = batch;
+    let requestSucceeded = false;
 
     try {
       translatedBatch = await requestTranslationBatch(batch, translationConfig, runtime);
+      requestSucceeded = true;
     } catch {
       translatedBatch = batch;
     }
@@ -1267,11 +1292,13 @@ async function translateTitlesWithCache(titles, translationConfig, runtime) {
         title,
       });
 
-      await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle }, {
-        namespace: CACHE_NAMESPACE_TRANSLATE,
-        ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
-        maxBytes: runtime.cacheMaxBytes,
-      }).catch(() => {});
+      if (requestSucceeded && shouldPersistTranslatedTitle(title, translatedTitle)) {
+        await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle }, {
+          namespace: CACHE_NAMESPACE_TRANSLATE,
+          ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
+          maxBytes: runtime.cacheMaxBytes,
+        }).catch(() => {});
+      }
     }
   }
 
@@ -1693,7 +1720,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.2",
+  version: "0.3.3",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
