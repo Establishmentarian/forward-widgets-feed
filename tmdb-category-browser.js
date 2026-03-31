@@ -24,12 +24,14 @@ const CACHE_NAMESPACE_TRANSLATE = 'cache:translate';
 const CACHE_MANIFEST_KEY = 'cache:manifest:v1';
 const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
+const TRANSLATION_OVERVIEW_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const TRANSLATION_FAILURE_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_BATCH_SIZE = 4;
+const TRANSLATION_LARGE_BATCH_SIZE = 20;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
 const TRANSLATION_INTER_BATCH_DELAY_MS = 350;
 const TRANSLATION_MAX_ATTEMPTS = 2;
-const TRANSLATION_PROMPT_VERSION = 'v6';
+const TRANSLATION_PROMPT_VERSION = 'v7';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
@@ -546,6 +548,27 @@ function normalizeUrl(value) {
   return normalizeTitle(value).replace(/\/+$/, '');
 }
 
+function isUsableTmdbChineseText(value) {
+  const normalizedValue = normalizeTitle(value);
+  return Boolean(normalizedValue && containsHan(normalizedValue));
+}
+
+function resolveLocalizedText({ simplifiedText, traditionalText, originalText }) {
+  const simplified = normalizeTitle(simplifiedText);
+  const traditional = normalizeTitle(traditionalText);
+  const original = normalizeTitle(originalText);
+
+  if (isUsableTmdbChineseText(simplified)) {
+    return simplified;
+  }
+
+  if (isUsableTmdbChineseText(traditional)) {
+    return traditional;
+  }
+
+  return simplified || traditional || original;
+}
+
 function sleep(ms) {
   const timers = getTimerFunctions();
 
@@ -560,6 +583,10 @@ function buildTranslationSystemPrompt({ strict = false } = {}) {
   return strict
     ? '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题统一转换为自然、简体中文片名或剧名。若没有官方中译名，也必须给出常见中文译名或简洁音译，不要保留英文、法文、西语、德语、俄语、韩语罗马字或其他非中文原文。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。'
     : '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题翻译成自然、简体中文片名或剧名。若 title 只是外文别名，originalTitle 仅用于辅助判断。若没有官方中译名，请给出常见中文译名或简洁音译。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。';
+}
+
+function buildOverviewTranslationSystemPrompt() {
+  return '你是影视简介翻译器。输入数组中的每一项都包含 text 和 contextTitle，请把 text 翻译成自然、简体中文简介。不得扩写、不得总结、不得增加原文没有的信息；contextTitle 仅用于辅助理解，不要把标题重复拼进简介。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。';
 }
 
 function stableStringify(value) {
@@ -725,6 +752,35 @@ function shouldPersistTranslatedTitle(originalTitle, translatedTitle) {
   return true;
 }
 
+function shouldPersistTranslatedOverview(originalText, translatedText) {
+  if (!isMeaningfulText(translatedText)) {
+    return false;
+  }
+
+  const normalizedOriginalText = normalizeTitle(originalText);
+  const normalizedTranslatedText = normalizeTitle(translatedText);
+
+  if (!normalizedOriginalText) {
+    return false;
+  }
+
+  if (
+    normalizedTranslatedText === normalizedOriginalText
+    && (!containsHan(normalizedOriginalText) || containsNonChineseScript(normalizedOriginalText))
+  ) {
+    return false;
+  }
+
+  if (
+    (!containsHan(normalizedOriginalText) || containsNonChineseScript(normalizedOriginalText))
+    && !containsHan(normalizedTranslatedText)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 function isRetryableTranslationError(error) {
   const message = normalizeTitle(error?.message ?? String(error ?? ''));
   if (!message) {
@@ -760,6 +816,108 @@ function getRawDate(item, mediaType) {
 
 function getRawAdultFlag(item) {
   return item?.adult === true;
+}
+
+function collectLocalizedEntries(simplifiedItems = [], traditionalItems = [], keySelector = (item) => item.id) {
+  const mergedByKey = new Map();
+
+  for (const item of traditionalItems ?? []) {
+    mergedByKey.set(keySelector(item), {
+      traditional: item,
+    });
+  }
+
+  for (const item of simplifiedItems ?? []) {
+    const key = keySelector(item);
+    const existing = mergedByKey.get(key) ?? {};
+    existing.simplified = item;
+    mergedByKey.set(key, existing);
+  }
+
+  const orderedKeys = [
+    ...(simplifiedItems ?? []).map((item) => keySelector(item)),
+    ...(traditionalItems ?? []).map((item) => keySelector(item)),
+  ];
+
+  return Array.from(new Set(orderedKeys))
+    .map((key) => ({
+      key,
+      simplified: mergedByKey.get(key)?.simplified,
+      traditional: mergedByKey.get(key)?.traditional,
+    }))
+    .filter((entry) => entry.simplified || entry.traditional);
+}
+
+function buildLocalizedRecord({
+  tmdbId,
+  mediaType,
+  simplifiedItem,
+  traditionalItem,
+  titleSelector,
+  originalTitleSelector = titleSelector,
+  overviewSelector = (item) => item?.overview,
+  dateSelector = (item) => getRawDate(item, mediaType),
+  genreIdsSelector = (item) => {
+    if (Array.isArray(item?.genre_ids)) {
+      return item.genre_ids;
+    }
+
+    if (Array.isArray(item?.genres)) {
+      return item.genres.map((genre) => genre.id).filter(Number.isFinite);
+    }
+
+    return [];
+  },
+  originalLanguageSelector = (item) => item?.original_language ?? '',
+  originCountrySelector = (item) => (Array.isArray(item?.origin_country) ? item.origin_country : []),
+  adultSelector = (item) => getRawAdultFlag(item),
+  voteCountSelector = (item) => (Number.isFinite(item?.vote_count) ? item.vote_count : 0),
+  voteAverageSelector = (item) => (Number.isFinite(item?.vote_average) ? item.vote_average : NaN),
+  posterPathSelector = (item) => item?.poster_path,
+  backdropPathSelector = (item) => item?.backdrop_path,
+}) {
+  const baseItem = simplifiedItem ?? traditionalItem;
+
+  if (!baseItem) {
+    return null;
+  }
+
+  const simplifiedTitle = normalizeTitle(simplifiedItem ? titleSelector(simplifiedItem) : '');
+  const traditionalTitle = normalizeTitle(traditionalItem ? titleSelector(traditionalItem) : '');
+  const originalTitle = normalizeTitle(originalTitleSelector(baseItem));
+  const simplifiedOverview = normalizeTitle(simplifiedItem ? overviewSelector(simplifiedItem) : '');
+  const traditionalOverview = normalizeTitle(traditionalItem ? overviewSelector(traditionalItem) : '');
+  const originalOverview = normalizeTitle(overviewSelector(baseItem));
+
+  return {
+    tmdbId,
+    mediaType,
+    displayTitle: resolveDisplayTitle({
+      simplifiedTitle,
+      traditionalTitle,
+      originalTitle,
+    }),
+    simplifiedTitle,
+    traditionalTitle,
+    originalTitle,
+    overview: resolveLocalizedText({
+      simplifiedText: simplifiedOverview,
+      traditionalText: traditionalOverview,
+      originalText: originalOverview,
+    }),
+    simplifiedOverview,
+    traditionalOverview,
+    originalOverview,
+    genreIds: genreIdsSelector(baseItem),
+    originalLanguage: originalLanguageSelector(baseItem),
+    originCountry: originCountrySelector(baseItem),
+    releaseDate: normalizeTitle(dateSelector(baseItem)),
+    adult: adultSelector(baseItem),
+    voteCount: voteCountSelector(baseItem),
+    voteAverage: voteAverageSelector(baseItem),
+    posterPath: buildImageUrl('w500', posterPathSelector(baseItem)),
+    backdropPath: buildImageUrl('w780', backdropPathSelector(baseItem)),
+  };
 }
 
 function normalizeTranslationConfig(params = {}) {
@@ -825,11 +983,32 @@ function buildTranslationJob(record) {
   const originalTitle = normalizeTitle(record.originalTitle) || title;
 
   return {
+    fieldKind: 'title',
     title,
     originalTitle,
     jobKey: stableStringify({
+      fieldKind: 'title',
       title,
       originalTitle,
+    }),
+  };
+}
+
+function buildOverviewTranslationJob(entry) {
+  const text = normalizeTitle(entry.overview)
+    || normalizeTitle(entry.simplifiedOverview)
+    || normalizeTitle(entry.traditionalOverview)
+    || normalizeTitle(entry.originalOverview);
+  const contextTitle = normalizeTitle(entry.displayTitle) || normalizeTitle(entry.originalTitle);
+
+  return {
+    fieldKind: 'overview',
+    text,
+    contextTitle,
+    jobKey: stableStringify({
+      fieldKind: 'overview',
+      text,
+      contextTitle,
     }),
   };
 }
@@ -863,29 +1042,11 @@ function chooseLocalizedField(primaryItem, secondaryItem, selector) {
 }
 
 function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle }) {
-  const primary = normalizeTitle(simplifiedTitle);
-  const fallback = normalizeTitle(traditionalTitle);
-  const original = normalizeTitle(originalTitle);
-
-  if (!primary) {
-    return fallback || original;
-  }
-
-  if (primary !== original) {
-    return primary;
-  }
-
-  if (!fallback || fallback === original) {
-    return primary;
-  }
-
-  // 这里专门处理“简体请求命中了原名，但繁体请求拿到了真实中文译名”的情况。
-  // 只要原名仍明显带有拉丁字母、日文假名或韩文，而繁体标题已经是汉字，就优先展示繁体。
-  if (!containsHan(original) || containsNonChineseScript(original)) {
-    return fallback;
-  }
-
-  return primary;
+  return resolveLocalizedText({
+    simplifiedText: simplifiedTitle,
+    traditionalText: traditionalTitle,
+    originalText: originalTitle,
+  });
 }
 
 function getKeywordCandidates(record) {
@@ -1056,68 +1217,25 @@ function getTmdbSortBy(mediaType, sortKey) {
 }
 
 function mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse) {
-  const mergedById = new Map();
-
-  for (const item of traditionalResponse.results ?? []) {
-    mergedById.set(item.id, {
-      traditional: item,
-    });
-  }
-
-  for (const item of simplifiedResponse.results ?? []) {
-    const existing = mergedById.get(item.id) ?? {};
-    existing.simplified = item;
-    mergedById.set(item.id, existing);
-  }
-
-  const orderedIds = [
-    ...(simplifiedResponse.results ?? []).map((item) => item.id),
-    ...(traditionalResponse.results ?? []).map((item) => item.id),
-  ];
-
-  const dedupedIds = Array.from(new Set(orderedIds));
-  const records = dedupedIds
-    .map((id) => {
-      const localized = mergedById.get(id);
-      const baseItem = localized?.simplified ?? localized?.traditional;
-
-      if (!baseItem) {
-        return null;
-      }
-
-      const simplifiedTitle = getRawTitle(localized.simplified, mediaType);
-      const traditionalTitle = getRawTitle(localized.traditional, mediaType);
-      const originalTitle = getRawOriginalTitle(baseItem, mediaType);
-      const displayTitle = resolveDisplayTitle({
-        simplifiedTitle,
-        traditionalTitle,
-        originalTitle,
-      });
-
-      return {
-        tmdbId: id,
+  const records = collectLocalizedEntries(
+    simplifiedResponse.results ?? [],
+    traditionalResponse?.results ?? [],
+    (item) => item.id,
+  )
+    .map(({ key, simplified, traditional }) =>
+      buildLocalizedRecord({
+        tmdbId: key,
         mediaType,
-        displayTitle,
-        simplifiedTitle: normalizeTitle(simplifiedTitle),
-        traditionalTitle: normalizeTitle(traditionalTitle),
-        originalTitle: normalizeTitle(originalTitle),
-        overview: chooseLocalizedField(localized.simplified, localized.traditional, (item) => item?.overview),
-        genreIds: Array.isArray(baseItem.genre_ids) ? baseItem.genre_ids : [],
-        originalLanguage: baseItem.original_language ?? '',
-        originCountry: Array.isArray(baseItem.origin_country) ? baseItem.origin_country : [],
-        releaseDate: getRawDate(baseItem, mediaType) ?? '',
-        adult: getRawAdultFlag(baseItem),
-        voteCount: Number.isFinite(baseItem.vote_count) ? baseItem.vote_count : 0,
-        voteAverage: Number.isFinite(baseItem.vote_average) ? baseItem.vote_average : NaN,
-        posterPath: buildImageUrl('w500', baseItem.poster_path),
-        backdropPath: buildImageUrl('w780', baseItem.backdrop_path),
-      };
-    })
+        simplifiedItem: simplified,
+        traditionalItem: traditional,
+        titleSelector: (item) => getRawTitle(item, mediaType),
+        originalTitleSelector: (item) => getRawOriginalTitle(item, mediaType),
+      }))
     .filter(Boolean);
 
   return {
     results: records,
-    totalPages: Math.max(simplifiedResponse.total_pages ?? 0, traditionalResponse.total_pages ?? 0),
+    totalPages: Math.max(simplifiedResponse.total_pages ?? 0, traditionalResponse?.total_pages ?? 0),
   };
 }
 
@@ -1127,6 +1245,13 @@ function createCacheState(storage, maxBytes) {
     maxBytes,
     manifest: null,
     queue: Promise.resolve(),
+  };
+}
+
+function createRequestMemo() {
+  return {
+    cachedJsonValues: new Map(),
+    tmdbResponses: new Map(),
   };
 }
 
@@ -1241,6 +1366,22 @@ async function getCachedJsonValue(cacheState, cacheKey) {
   });
 }
 
+async function getCachedJsonValueFromRuntime(runtime, cacheKey) {
+  if (runtime.requestMemo.cachedJsonValues.has(cacheKey)) {
+    return runtime.requestMemo.cachedJsonValues.get(cacheKey);
+  }
+
+  const pendingValue = getCachedJsonValue(runtime.cacheState, cacheKey).catch((error) => {
+    runtime.requestMemo.cachedJsonValues.delete(cacheKey);
+    throw error;
+  });
+
+  runtime.requestMemo.cachedJsonValues.set(cacheKey, pendingValue);
+  const resolvedValue = await pendingValue;
+  runtime.requestMemo.cachedJsonValues.set(cacheKey, resolvedValue);
+  return resolvedValue;
+}
+
 async function setCachedJsonValue(cacheState, cacheKey, value, { namespace, ttlSeconds, maxBytes }) {
   return withCacheLock(cacheState, async () => {
     const rawValue = JSON.stringify(value);
@@ -1271,6 +1412,11 @@ async function setCachedJsonValue(cacheState, cacheKey, value, { namespace, ttlS
   });
 }
 
+async function setCachedJsonValueFromRuntime(runtime, cacheKey, value, options) {
+  runtime.requestMemo.cachedJsonValues.set(cacheKey, value);
+  return setCachedJsonValue(runtime.cacheState, cacheKey, value, options);
+}
+
 async function cachedTmdbGet(path, options, runtime) {
   const cacheKey = buildCacheStorageKey(CACHE_NAMESPACE_TMDB, {
     path,
@@ -1279,20 +1425,34 @@ async function cachedTmdbGet(path, options, runtime) {
     ),
   });
 
-  const cachedValue = await getCachedJsonValue(runtime.cacheState, cacheKey);
-  if (cachedValue) {
-    return cachedValue;
+  if (runtime.requestMemo.tmdbResponses.has(cacheKey)) {
+    return runtime.requestMemo.tmdbResponses.get(cacheKey);
   }
 
-  const response = await runtime.tmdbGet(path, options);
+  const pendingResponse = (async () => {
+    const cachedValue = await getCachedJsonValueFromRuntime(runtime, cacheKey);
+    if (cachedValue) {
+      return cachedValue;
+    }
 
-  await setCachedJsonValue(runtime.cacheState, cacheKey, response, {
-    namespace: CACHE_NAMESPACE_TMDB,
-    ttlSeconds: TMDB_CACHE_TTL_SECONDS,
-    maxBytes: runtime.cacheMaxBytes,
-  }).catch(() => {});
+    const response = await runtime.tmdbGet(path, options);
 
-  return response;
+    await setCachedJsonValueFromRuntime(runtime, cacheKey, response, {
+      namespace: CACHE_NAMESPACE_TMDB,
+      ttlSeconds: TMDB_CACHE_TTL_SECONDS,
+      maxBytes: runtime.cacheMaxBytes,
+    }).catch(() => {});
+
+    return response;
+  })().catch((error) => {
+    runtime.requestMemo.tmdbResponses.delete(cacheKey);
+    throw error;
+  });
+
+  runtime.requestMemo.tmdbResponses.set(cacheKey, pendingResponse);
+  const resolvedResponse = await pendingResponse;
+  runtime.requestMemo.tmdbResponses.set(cacheKey, resolvedResponse);
+  return resolvedResponse;
 }
 
 function buildTranslationItemsPayload(items) {
@@ -1302,16 +1462,34 @@ function buildTranslationItemsPayload(items) {
   }));
 }
 
+function buildOverviewTranslationItemsPayload(items) {
+  return items.map((item) => ({
+    text: item.text,
+    contextTitle: item.contextTitle,
+  }));
+}
+
 function buildTranslationCacheKey(job, primaryConfig, fallbackConfig) {
   return buildCacheStorageKey(CACHE_NAMESPACE_TRANSLATE, {
+    fieldKind: job.fieldKind ?? 'title',
     primaryBaseUrl: primaryConfig?.baseUrl ?? '',
     primaryModel: primaryConfig?.model ?? '',
     fallbackBaseUrl: fallbackConfig?.baseUrl ?? '',
     fallbackModel: fallbackConfig?.model ?? '',
     promptVersion: TRANSLATION_PROMPT_VERSION,
-    title: job.title,
-    originalTitle: job.originalTitle,
+    title: job.title ?? '',
+    originalTitle: job.originalTitle ?? '',
+    text: job.text ?? '',
+    contextTitle: job.contextTitle ?? '',
   });
+}
+
+function chooseOverviewTranslationConfig(primaryConfig) {
+  if (hasTranslationConfig(primaryConfig) && !isTranslationProxyMode(primaryConfig) && primaryConfig.token) {
+    return primaryConfig;
+  }
+
+  return normalizeTranslationConfig(GLOBAL_PARAM_DEFAULTS);
 }
 
 async function requestTranslationBatch(items, translationConfig, runtime, { strict = false } = {}) {
@@ -1416,6 +1594,83 @@ async function requestTranslationBatchWithBackoff(batch, translationConfig, runt
   };
 }
 
+async function requestOverviewBatch(items, translationConfig, runtime) {
+  if (!items.length) {
+    return [];
+  }
+
+  const effectiveConfig = chooseOverviewTranslationConfig(translationConfig);
+  if (!hasTranslationConfig(effectiveConfig) || !effectiveConfig.token) {
+    return items.map((item) => item.text);
+  }
+
+  const requestBody = {
+    model: effectiveConfig.model,
+    temperature: 0.1,
+    max_tokens: 400,
+    response_format: {
+      type: 'json_object',
+    },
+    messages: [
+      {
+        role: 'system',
+        content: buildOverviewTranslationSystemPrompt(),
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({ items: buildOverviewTranslationItemsPayload(items) }),
+      },
+    ],
+  };
+
+  if (modelSupportsThinkingToggle(effectiveConfig.model)) {
+    requestBody.enable_thinking = false;
+  }
+
+  const response = await runtime.httpPost(
+    buildOpenAiChatCompletionsUrl(effectiveConfig.baseUrl),
+    requestBody,
+    {
+      headers: {
+        Authorization: `Bearer ${effectiveConfig.token}`,
+      },
+      timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
+    },
+  );
+
+  const content = response?.choices?.[0]?.message?.content ?? '';
+  const parsedTranslations = parseTranslationResponseContent(content, items.length);
+
+  return items.map((item, index) => normalizeTitle(parsedTranslations[index]) || item.text);
+}
+
+async function requestOverviewBatchWithBackoff(batch, translationConfig, runtime) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return {
+        translatedBatch: await requestOverviewBatch(batch, translationConfig, runtime),
+        requestSucceeded: true,
+      };
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= TRANSLATION_MAX_ATTEMPTS || !isRetryableTranslationError(error)) {
+        break;
+      }
+
+      await sleep(600 * attempt);
+    }
+  }
+
+  return {
+    translatedBatch: batch.map((item) => item.text),
+    requestSucceeded: false,
+    error: lastError,
+  };
+}
+
 function collectUntranslatedEntries(batch, translatedBatch) {
   return batch
     .map((item, index) => ({
@@ -1436,6 +1691,51 @@ function collectUntranslatedEntries(batch, translatedBatch) {
 
       return !containsHan(normalizedSource) || containsNonChineseScript(normalizedSource);
     });
+}
+
+function collectUntranslatedOverviewEntries(batch, translatedBatch) {
+  return batch
+    .map((item, index) => ({
+      job: item,
+      translatedText: normalizeTitle(translatedBatch[index]) || item.text,
+    }))
+    .filter(({ job, translatedText }) => {
+      const normalizedSource = normalizeTitle(job.text);
+
+      if (!normalizedSource) {
+        return false;
+      }
+
+      if (isUsableTmdbChineseText(translatedText)) {
+        return false;
+      }
+
+      return !containsHan(normalizedSource) || containsNonChineseScript(normalizedSource);
+    });
+}
+
+async function persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle) {
+  await setCachedJsonValueFromRuntime(runtime, cacheKey, { translatedTitle, status: 'success' }, {
+    namespace: CACHE_NAMESPACE_TRANSLATE,
+    ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
+    maxBytes: runtime.cacheMaxBytes,
+  }).catch(() => {});
+}
+
+async function persistSuccessfulOverviewTranslation(runtime, cacheKey, translatedText) {
+  await setCachedJsonValueFromRuntime(runtime, cacheKey, { translatedTitle: translatedText, status: 'success' }, {
+    namespace: CACHE_NAMESPACE_TRANSLATE,
+    ttlSeconds: TRANSLATION_OVERVIEW_CACHE_TTL_SECONDS,
+    maxBytes: runtime.cacheMaxBytes,
+  }).catch(() => {});
+}
+
+async function persistFailedTranslation(runtime, cacheKey) {
+  await setCachedJsonValueFromRuntime(runtime, cacheKey, { status: 'failed' }, {
+    namespace: CACHE_NAMESPACE_TRANSLATE,
+    ttlSeconds: TRANSLATION_FAILURE_CACHE_TTL_SECONDS,
+    maxBytes: runtime.cacheMaxBytes,
+  }).catch(() => {});
 }
 
 async function translateSingleJobWithFallback(job, primaryConfig, runtime) {
@@ -1497,7 +1797,7 @@ async function translateTitlesWithCache(jobs, translationConfig, runtime) {
 
   for (const job of dedupedJobs) {
     const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
-    const cachedValue = await getCachedJsonValue(runtime.cacheState, cacheKey);
+    const cachedValue = await getCachedJsonValueFromRuntime(runtime, cacheKey);
 
     if (cachedValue?.translatedTitle) {
       translatedMap.set(job.jobKey, normalizeTitle(cachedValue.translatedTitle));
@@ -1511,53 +1811,120 @@ async function translateTitlesWithCache(jobs, translationConfig, runtime) {
     missingJobs.push(job);
   }
 
-  for (let index = 0; index < missingJobs.length; index += TRANSLATION_BATCH_SIZE) {
-    const batch = missingJobs.slice(index, index + TRANSLATION_BATCH_SIZE);
-    const { translatedBatch, requestSucceeded } = hasTranslationConfig(translationConfig)
-      ? await requestTranslationBatchWithBackoff(
-        batch,
-        translationConfig,
-        runtime,
-      )
+  for (let largeIndex = 0; largeIndex < missingJobs.length; largeIndex += TRANSLATION_LARGE_BATCH_SIZE) {
+    const largeBatch = missingJobs.slice(largeIndex, largeIndex + TRANSLATION_LARGE_BATCH_SIZE);
+    const { translatedBatch } = hasTranslationConfig(translationConfig)
+      ? await requestTranslationBatchWithBackoff(largeBatch, translationConfig, runtime)
       : {
-        translatedBatch: batch.map((job) => job.title),
-        requestSucceeded: false,
+        translatedBatch: largeBatch.map((job) => job.title),
       };
-    const unresolvedEntries = collectUntranslatedEntries(batch, translatedBatch);
+    const unresolvedLargeEntries = collectUntranslatedEntries(largeBatch, translatedBatch);
+    const unresolvedJobKeys = new Set(unresolvedLargeEntries.map((entry) => entry.job.jobKey));
+    const unresolvedJobs = [];
 
-    for (const [batchIndex, job] of batch.entries()) {
+    for (const [batchIndex, job] of largeBatch.entries()) {
       const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || job.title;
       const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
 
-      if (!unresolvedEntries.some((entry) => entry.job.jobKey === job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
+      if (!unresolvedJobKeys.has(job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
         translatedMap.set(job.jobKey, translatedTitle);
-        await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle, status: 'success' }, {
-          namespace: CACHE_NAMESPACE_TRANSLATE,
-          ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
-          maxBytes: runtime.cacheMaxBytes,
-        }).catch(() => {});
-        continue;
-      }
-
-      const singleResult = await translateSingleJobWithFallback(job, translationConfig, runtime);
-      if (isUsableTranslatedChineseTitle(singleResult.translatedTitle)) {
-        translatedMap.set(job.jobKey, singleResult.translatedTitle);
-        await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle: singleResult.translatedTitle, status: 'success' }, {
-          namespace: CACHE_NAMESPACE_TRANSLATE,
-          ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
-          maxBytes: runtime.cacheMaxBytes,
-        }).catch(() => {});
+        await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
       } else {
-        await setCachedJsonValue(runtime.cacheState, cacheKey, { status: 'failed' }, {
-          namespace: CACHE_NAMESPACE_TRANSLATE,
-          ttlSeconds: TRANSLATION_FAILURE_CACHE_TTL_SECONDS,
-          maxBytes: runtime.cacheMaxBytes,
-        }).catch(() => {});
+        unresolvedJobs.push(job);
       }
     }
 
-    if (getTimerFunctions().setTimeout && index + TRANSLATION_BATCH_SIZE < missingJobs.length) {
+    for (let smallIndex = 0; smallIndex < unresolvedJobs.length; smallIndex += TRANSLATION_BATCH_SIZE) {
+      const smallBatch = unresolvedJobs.slice(smallIndex, smallIndex + TRANSLATION_BATCH_SIZE);
+      const { translatedBatch: translatedSmallBatch } = hasTranslationConfig(translationConfig)
+        ? await requestTranslationBatchWithBackoff(smallBatch, translationConfig, runtime)
+        : {
+          translatedBatch: smallBatch.map((job) => job.title),
+        };
+      const unresolvedSmallEntries = collectUntranslatedEntries(smallBatch, translatedSmallBatch);
+      const unresolvedSmallKeys = new Set(unresolvedSmallEntries.map((entry) => entry.job.jobKey));
+
+      for (const [batchIndex, job] of smallBatch.entries()) {
+        const translatedTitle = normalizeTitle(translatedSmallBatch[batchIndex]) || job.title;
+        const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
+
+        if (!unresolvedSmallKeys.has(job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
+          translatedMap.set(job.jobKey, translatedTitle);
+          await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
+          continue;
+        }
+
+        const singleResult = await translateSingleJobWithFallback(job, translationConfig, runtime);
+        if (isUsableTranslatedChineseTitle(singleResult.translatedTitle)) {
+          translatedMap.set(job.jobKey, singleResult.translatedTitle);
+          await persistSuccessfulTitleTranslation(runtime, cacheKey, singleResult.translatedTitle);
+        } else {
+          await persistFailedTranslation(runtime, cacheKey);
+        }
+      }
+
+      if (getTimerFunctions().setTimeout && smallIndex + TRANSLATION_BATCH_SIZE < unresolvedJobs.length) {
+        await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
+      }
+    }
+
+    if (getTimerFunctions().setTimeout && largeIndex + TRANSLATION_LARGE_BATCH_SIZE < missingJobs.length) {
       await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
+    }
+  }
+
+  return translatedMap;
+}
+
+async function translateOverviewsWithCache(entries, translationConfig, runtime) {
+  if (!entries.length) {
+    return new Map();
+  }
+
+  const dedupedJobs = Array.from(
+    new Map(
+      entries
+        .map((entry) => buildOverviewTranslationJob(entry))
+        .filter((job) => isMeaningfulText(job?.text))
+        .map((job) => [job.jobKey, job]),
+    ).values(),
+  );
+  const translatedMap = new Map();
+  const missingJobs = [];
+  const overviewConfig = chooseOverviewTranslationConfig(translationConfig);
+
+  for (const job of dedupedJobs) {
+    const cacheKey = buildTranslationCacheKey(job, overviewConfig, null);
+    const cachedValue = await getCachedJsonValueFromRuntime(runtime, cacheKey);
+
+    if (cachedValue?.translatedTitle) {
+      translatedMap.set(job.jobKey, normalizeTitle(cachedValue.translatedTitle));
+      continue;
+    }
+
+    if (cachedValue?.status === 'failed') {
+      continue;
+    }
+
+    missingJobs.push(job);
+  }
+
+  for (let index = 0; index < missingJobs.length; index += TRANSLATION_LARGE_BATCH_SIZE) {
+    const batch = missingJobs.slice(index, index + TRANSLATION_LARGE_BATCH_SIZE);
+    const { translatedBatch } = await requestOverviewBatchWithBackoff(batch, overviewConfig, runtime);
+    const unresolvedEntries = collectUntranslatedOverviewEntries(batch, translatedBatch);
+    const unresolvedKeys = new Set(unresolvedEntries.map((entry) => entry.job.jobKey));
+
+    for (const [batchIndex, job] of batch.entries()) {
+      const translatedText = normalizeTitle(translatedBatch[batchIndex]) || job.text;
+      const cacheKey = buildTranslationCacheKey(job, overviewConfig, null);
+
+      if (!unresolvedKeys.has(job.jobKey) && shouldPersistTranslatedOverview(job.text, translatedText)) {
+        translatedMap.set(job.jobKey, translatedText);
+        await persistSuccessfulOverviewTranslation(runtime, cacheKey, translatedText);
+      } else {
+        await persistFailedTranslation(runtime, cacheKey);
+      }
     }
   }
 
@@ -1595,6 +1962,48 @@ async function applyMachineTranslationFallback(records, translationConfig, runti
   return records;
 }
 
+function shouldAttemptOverviewTranslation(entry) {
+  if (isUsableTmdbChineseText(entry.simplifiedOverview) || isUsableTmdbChineseText(entry.traditionalOverview)) {
+    return false;
+  }
+
+  const sourceText = normalizeTitle(entry.overview)
+    || normalizeTitle(entry.simplifiedOverview)
+    || normalizeTitle(entry.traditionalOverview)
+    || normalizeTitle(entry.originalOverview);
+
+  if (!sourceText) {
+    return false;
+  }
+
+  if (isUsableTmdbChineseText(sourceText) && !containsNonChineseScript(sourceText)) {
+    return false;
+  }
+
+  return !containsHan(sourceText) || containsNonChineseScript(sourceText);
+}
+
+async function applyOverviewTranslationFallback(entries, translationConfig, runtime) {
+  const translationTargets = entries.filter((entry) => shouldAttemptOverviewTranslation(entry));
+
+  if (!translationTargets.length) {
+    return entries;
+  }
+
+  const translatedMap = await translateOverviewsWithCache(translationTargets, translationConfig, runtime);
+
+  for (const entry of translationTargets) {
+    const translationJob = buildOverviewTranslationJob(entry);
+    const translatedOverview = translatedMap.get(translationJob.jobKey);
+
+    if (isMeaningfulText(translatedOverview)) {
+      entry.overview = translatedOverview;
+    }
+  }
+
+  return entries;
+}
+
 function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate) {
   const params = {
     include_adult: false,
@@ -1615,6 +2024,18 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
   return stringifyParams(params);
 }
 
+function shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse) {
+  return (simplifiedResponse?.results ?? []).some((item) => {
+    const simplifiedTitle = getRawTitle(item, mediaType);
+    if (!isUsableTmdbChineseTitle(simplifiedTitle)) {
+      return true;
+    }
+
+    const simplifiedOverview = normalizeTitle(item?.overview);
+    return Boolean(simplifiedOverview && !isUsableTmdbChineseText(simplifiedOverview));
+  });
+}
+
 function createRuntime(rawParams, overrides = {}) {
   const storage = overrides.storage ?? getDefaultStorage();
   const cacheMaxBytes = overrides.cacheOptions?.maxBytes ?? CACHE_MAX_BYTES;
@@ -1625,6 +2046,7 @@ function createRuntime(rawParams, overrides = {}) {
     storage,
     cacheMaxBytes,
     cacheState: createCacheState(storage, cacheMaxBytes),
+    requestMemo: createRequestMemo(),
     translationConfig: normalizeTranslationConfig(rawParams),
     fallbackTranslationConfig: buildFallbackTranslationConfig(),
   };
@@ -1633,21 +2055,22 @@ function createRuntime(rawParams, overrides = {}) {
 async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
   const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
+  const simplifiedResponse = await cachedTmdbGet(endpoint, {
+    params: {
+      ...commonParams,
+      language: TMDB_LANGUAGE_SIMPLIFIED,
+    },
+  }, runtime);
 
-  const [simplifiedResponse, traditionalResponse] = await Promise.all([
-    cachedTmdbGet(endpoint, {
-      params: {
-        ...commonParams,
-        language: TMDB_LANGUAGE_SIMPLIFIED,
-      },
-    }, runtime),
-    cachedTmdbGet(endpoint, {
+  let traditionalResponse = null;
+  if (shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
+    traditionalResponse = await cachedTmdbGet(endpoint, {
       params: {
         ...commonParams,
         language: TMDB_LANGUAGE_TRADITIONAL,
       },
-    }, runtime),
-  ]);
+    }, runtime);
+  }
 
   return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, traditionalResponse ?? {});
 }
@@ -1805,23 +2228,470 @@ function sortCatalogRecords(records, sortKey) {
   return sorted;
 }
 
-function mapRecordToVideoItem(record, categoryTitle) {
-  const detailText = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
+const DETAIL_LINK_SCHEME = 'fw-tmdb:';
 
+function buildDetailLink({ mediaType, tmdbId, seasonNumber, episodeNumber, translationConfig }) {
+  const queryParams = new URLSearchParams();
+
+  if (isMeaningfulText(translationConfig?.baseUrl)) {
+    queryParams.set(GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL, translationConfig.baseUrl);
+  }
+
+  if (isMeaningfulText(translationConfig?.token)) {
+    queryParams.set(GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN, translationConfig.token);
+  }
+
+  if (isMeaningfulText(translationConfig?.model)) {
+    queryParams.set(GLOBAL_PARAM_KEYS.TRANSLATION_MODEL, translationConfig.model);
+  }
+
+  let link = `${DETAIL_LINK_SCHEME}//${mediaType}/${tmdbId}`;
+
+  if (Number.isFinite(seasonNumber)) {
+    link += `/season/${seasonNumber}`;
+  }
+
+  if (Number.isFinite(episodeNumber)) {
+    link += `/episode/${episodeNumber}`;
+  }
+
+  const queryString = queryParams.toString();
+  return queryString ? `${link}?${queryString}` : link;
+}
+
+function parseDetailLink(link) {
+  const parsedUrl = new URL(link);
+  if (parsedUrl.protocol !== `${DETAIL_LINK_SCHEME}`) {
+    throw new Error(`不支持的详情链接：${link}`);
+  }
+
+  const mediaType = parsedUrl.hostname;
+  const segments = parsedUrl.pathname.split('/').filter(Boolean);
+  const tmdbId = Number.parseInt(segments[0] ?? '', 10);
+
+  if (!Number.isFinite(tmdbId) || ![MEDIA_TYPES.MOVIE, MEDIA_TYPES.TV].includes(mediaType)) {
+    throw new Error(`无效的详情链接：${link}`);
+  }
+
+  const seasonIndex = segments.indexOf('season');
+  const episodeIndex = segments.indexOf('episode');
+  const seasonNumber = seasonIndex !== -1 ? Number.parseInt(segments[seasonIndex + 1] ?? '', 10) : null;
+  const episodeNumber = episodeIndex !== -1 ? Number.parseInt(segments[episodeIndex + 1] ?? '', 10) : null;
+
+  return {
+    link,
+    mediaType,
+    tmdbId,
+    seasonNumber: Number.isFinite(seasonNumber) ? seasonNumber : null,
+    episodeNumber: Number.isFinite(episodeNumber) ? episodeNumber : null,
+    rawParams: Object.fromEntries(parsedUrl.searchParams.entries()),
+  };
+}
+
+function formatRatingValue(voteAverage) {
+  return Number.isFinite(voteAverage) ? voteAverage.toFixed(1) : undefined;
+}
+
+function buildDescriptionText(parts, overview) {
+  const header = parts.filter(Boolean).join(' · ');
+  const normalizedOverview = normalizeTitle(overview);
+
+  if (header && normalizedOverview) {
+    return `${header}\n${normalizedOverview}`;
+  }
+
+  return header || normalizedOverview || undefined;
+}
+
+function buildDetailItem(record, link, description, { childItems = [], genreTitle } = {}) {
   return {
     id: String(record.tmdbId),
     tmdbId: record.tmdbId,
-    type: 'tmdb',
+    type: 'detail',
+    link,
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
     posterPath: record.posterPath,
     backdropPath: record.backdropPath,
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
+    rating: formatRatingValue(record.voteAverage),
+    genreTitle: genreTitle ?? (record.genreIds?.length ? buildGenreText(record.genreIds, record.mediaType) : undefined),
+    description,
+    childItems: childItems.length ? childItems : undefined,
+  };
+}
+
+function buildChildDetailItem(record, link, description, { mediaType = record.mediaType } = {}) {
+  return {
+    id: String(record.tmdbId),
+    tmdbId: record.tmdbId,
+    type: 'detail',
+    link,
+    title: record.displayTitle || record.originalTitle || `${mediaType}-${record.tmdbId}`,
+    posterPath: record.posterPath,
+    backdropPath: record.backdropPath,
+    releaseDate: record.releaseDate || undefined,
+    mediaType,
+    rating: formatRatingValue(record.voteAverage),
+    description,
+  };
+}
+
+function mapRecordToVideoItem(record, categoryTitle, translationConfig) {
+  const detailText = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
+
+  return {
+    id: String(record.tmdbId),
+    tmdbId: record.tmdbId,
+    type: 'detail',
+    link: buildDetailLink({
+      mediaType: record.mediaType,
+      tmdbId: record.tmdbId,
+      translationConfig,
+    }),
+    title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
+    posterPath: record.posterPath,
+    backdropPath: record.backdropPath,
+    releaseDate: record.releaseDate || undefined,
+    mediaType: record.mediaType,
+    rating: formatRatingValue(record.voteAverage),
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
     description: detailText
       ? `${detailText}\n${record.overview || '暂无简介'}`
       : record.overview || '暂无简介',
   };
+}
+
+async function fetchLocalizedTmdbResource(path, runtime, { params = {}, shouldFetchTraditional } = {}) {
+  const simplified = await cachedTmdbGet(path, {
+    params: {
+      ...params,
+      language: TMDB_LANGUAGE_SIMPLIFIED,
+    },
+  }, runtime);
+
+  let traditional = null;
+  if (!shouldFetchTraditional || shouldFetchTraditional(simplified)) {
+    traditional = await cachedTmdbGet(path, {
+      params: {
+        ...params,
+        language: TMDB_LANGUAGE_TRADITIONAL,
+      },
+    }, runtime);
+  }
+
+  return {
+    simplified,
+    traditional,
+  };
+}
+
+function shouldFetchTraditionalForMovieDetail(simplifiedResponse) {
+  return (
+    !isUsableTmdbChineseTitle(simplifiedResponse?.title)
+    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
+  );
+}
+
+function shouldFetchTraditionalForSeriesDetail(simplifiedResponse) {
+  if (
+    !isUsableTmdbChineseTitle(simplifiedResponse?.name)
+    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
+  ) {
+    return true;
+  }
+
+  return (simplifiedResponse?.seasons ?? []).some((season) => !isUsableTmdbChineseTitle(season?.name));
+}
+
+function shouldFetchTraditionalForSeasonDetail(simplifiedResponse) {
+  if (
+    !isUsableTmdbChineseTitle(simplifiedResponse?.name)
+    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
+  ) {
+    return true;
+  }
+
+  return (simplifiedResponse?.episodes ?? []).some((episode) => (
+    !isUsableTmdbChineseTitle(episode?.name)
+    || !isUsableTmdbChineseText(episode?.overview)
+  ));
+}
+
+function shouldFetchTraditionalForEpisodeDetail(simplifiedResponse) {
+  return (
+    !isUsableTmdbChineseTitle(simplifiedResponse?.name)
+    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
+  );
+}
+
+function buildMovieDetailRecord(localizedMovie) {
+  return buildLocalizedRecord({
+    tmdbId: localizedMovie.simplified?.id ?? localizedMovie.traditional?.id,
+    mediaType: MEDIA_TYPES.MOVIE,
+    simplifiedItem: localizedMovie.simplified,
+    traditionalItem: localizedMovie.traditional,
+    titleSelector: (item) => item?.title,
+    originalTitleSelector: (item) => item?.original_title,
+  });
+}
+
+function buildSeriesDetailRecord(localizedSeries) {
+  return buildLocalizedRecord({
+    tmdbId: localizedSeries.simplified?.id ?? localizedSeries.traditional?.id,
+    mediaType: MEDIA_TYPES.TV,
+    simplifiedItem: localizedSeries.simplified,
+    traditionalItem: localizedSeries.traditional,
+    titleSelector: (item) => item?.name,
+    originalTitleSelector: (item) => item?.original_name,
+    genreIdsSelector: (item) => Array.isArray(item?.genres) ? item.genres.map((genre) => genre.id).filter(Number.isFinite) : [],
+  });
+}
+
+function buildSeasonRecords(localizedSeries) {
+  return collectLocalizedEntries(
+    localizedSeries.simplified?.seasons ?? [],
+    localizedSeries.traditional?.seasons ?? [],
+    (season) => season.season_number,
+  )
+    .map(({ key, simplified, traditional }) => {
+      const record = buildLocalizedRecord({
+        tmdbId: simplified?.id ?? traditional?.id ?? key,
+        mediaType: MEDIA_TYPES.TV,
+        simplifiedItem: simplified,
+        traditionalItem: traditional,
+        titleSelector: (item) => item?.name,
+        originalTitleSelector: (item) => item?.name,
+        dateSelector: (item) => item?.air_date,
+        genreIdsSelector: () => [],
+        originalLanguageSelector: () => '',
+        originCountrySelector: () => [],
+        adultSelector: () => false,
+        voteCountSelector: () => 0,
+        voteAverageSelector: () => NaN,
+        backdropPathSelector: (item) => item?.poster_path,
+      });
+
+      if (!record) {
+        return null;
+      }
+
+      record.seasonNumber = key;
+      return record;
+    })
+    .filter(Boolean)
+    .sort((left, right) => (left.seasonNumber ?? 0) - (right.seasonNumber ?? 0));
+}
+
+function buildSeasonDetailRecord(localizedSeason, seriesId, seasonNumber) {
+  const record = buildLocalizedRecord({
+    tmdbId: localizedSeason.simplified?.id ?? localizedSeason.traditional?.id ?? seasonNumber,
+    mediaType: MEDIA_TYPES.TV,
+    simplifiedItem: localizedSeason.simplified,
+    traditionalItem: localizedSeason.traditional,
+    titleSelector: (item) => item?.name,
+    originalTitleSelector: (item) => item?.name,
+    dateSelector: (item) => item?.air_date,
+    genreIdsSelector: () => [],
+    originalLanguageSelector: () => '',
+    originCountrySelector: () => [],
+    adultSelector: () => false,
+    voteCountSelector: () => 0,
+    voteAverageSelector: () => NaN,
+    backdropPathSelector: (item) => item?.poster_path,
+  });
+
+  if (record) {
+    record.parentTmdbId = seriesId;
+    record.seasonNumber = seasonNumber;
+  }
+
+  return record;
+}
+
+function buildEpisodeRecords(localizedSeason, seriesId, seasonNumber) {
+  return collectLocalizedEntries(
+    localizedSeason.simplified?.episodes ?? [],
+    localizedSeason.traditional?.episodes ?? [],
+    (episode) => episode.episode_number,
+  )
+    .map(({ key, simplified, traditional }) => {
+      const record = buildLocalizedRecord({
+        tmdbId: simplified?.id ?? traditional?.id ?? key,
+        mediaType: MEDIA_TYPES.TV,
+        simplifiedItem: simplified,
+        traditionalItem: traditional,
+        titleSelector: (item) => item?.name,
+        originalTitleSelector: (item) => item?.name,
+        dateSelector: (item) => item?.air_date,
+        genreIdsSelector: () => [],
+        originalLanguageSelector: () => '',
+        originCountrySelector: () => [],
+        adultSelector: () => false,
+        voteCountSelector: () => 0,
+        voteAverageSelector: () => NaN,
+        posterPathSelector: (item) => item?.still_path,
+        backdropPathSelector: (item) => item?.still_path,
+      });
+
+      if (!record) {
+        return null;
+      }
+
+      record.parentTmdbId = seriesId;
+      record.seasonNumber = seasonNumber;
+      record.episodeNumber = key;
+      return record;
+    })
+    .filter(Boolean)
+    .sort((left, right) => (left.episodeNumber ?? 0) - (right.episodeNumber ?? 0));
+}
+
+function buildEpisodeDetailRecord(localizedEpisode, seriesId, seasonNumber, episodeNumber) {
+  const record = buildLocalizedRecord({
+    tmdbId: localizedEpisode.simplified?.id ?? localizedEpisode.traditional?.id ?? episodeNumber,
+    mediaType: MEDIA_TYPES.TV,
+    simplifiedItem: localizedEpisode.simplified,
+    traditionalItem: localizedEpisode.traditional,
+    titleSelector: (item) => item?.name,
+    originalTitleSelector: (item) => item?.name,
+    dateSelector: (item) => item?.air_date,
+    genreIdsSelector: () => [],
+    originalLanguageSelector: () => '',
+    originCountrySelector: () => [],
+    adultSelector: () => false,
+    voteCountSelector: () => 0,
+    voteAverageSelector: () => NaN,
+    posterPathSelector: (item) => item?.still_path,
+    backdropPathSelector: (item) => item?.still_path,
+  });
+
+  if (record) {
+    record.parentTmdbId = seriesId;
+    record.seasonNumber = seasonNumber;
+    record.episodeNumber = episodeNumber;
+  }
+
+  return record;
+}
+
+async function loadMovieDetailFromLink(parsedLink, runtime) {
+  const localizedMovie = await fetchLocalizedTmdbResource(`movie/${parsedLink.tmdbId}`, runtime, {
+    shouldFetchTraditional: shouldFetchTraditionalForMovieDetail,
+  });
+  const movieRecord = buildMovieDetailRecord(localizedMovie);
+
+  await applyMachineTranslationFallback([movieRecord], runtime.translationConfig, runtime);
+  await applyOverviewTranslationFallback([movieRecord], runtime.translationConfig, runtime);
+
+  return buildDetailItem(
+    movieRecord,
+    parsedLink.link,
+    buildDescriptionText(
+      [movieRecord.releaseDate, buildGenreText(movieRecord.genreIds, movieRecord.mediaType)],
+      movieRecord.overview || '暂无简介',
+    ),
+  );
+}
+
+async function loadSeriesDetailFromLink(parsedLink, runtime) {
+  const localizedSeries = await fetchLocalizedTmdbResource(`tv/${parsedLink.tmdbId}`, runtime, {
+    shouldFetchTraditional: shouldFetchTraditionalForSeriesDetail,
+  });
+  const seriesRecord = buildSeriesDetailRecord(localizedSeries);
+  const seasonRecords = buildSeasonRecords(localizedSeries);
+
+  await applyMachineTranslationFallback([seriesRecord, ...seasonRecords], runtime.translationConfig, runtime);
+  await applyOverviewTranslationFallback([seriesRecord], runtime.translationConfig, runtime);
+
+  const childItems = seasonRecords.map((seasonRecord) =>
+    buildChildDetailItem(
+      seasonRecord,
+      buildDetailLink({
+        mediaType: MEDIA_TYPES.TV,
+        tmdbId: parsedLink.tmdbId,
+        seasonNumber: seasonRecord.seasonNumber,
+        translationConfig: runtime.translationConfig,
+      }),
+      buildDescriptionText(
+        [seasonRecord.releaseDate, `第 ${seasonRecord.seasonNumber} 季`],
+        seasonRecord.overview || '暂无简介',
+      ),
+    ));
+
+  return buildDetailItem(
+    seriesRecord,
+    parsedLink.link,
+    buildDescriptionText(
+      [seriesRecord.releaseDate, buildGenreText(seriesRecord.genreIds, seriesRecord.mediaType)],
+      seriesRecord.overview || '暂无简介',
+    ),
+    { childItems },
+  );
+}
+
+async function loadSeasonDetailFromLink(parsedLink, runtime) {
+  const localizedSeason = await fetchLocalizedTmdbResource(
+    `tv/${parsedLink.tmdbId}/season/${parsedLink.seasonNumber}`,
+    runtime,
+    { shouldFetchTraditional: shouldFetchTraditionalForSeasonDetail },
+  );
+  const seasonRecord = buildSeasonDetailRecord(localizedSeason, parsedLink.tmdbId, parsedLink.seasonNumber);
+  const episodeRecords = buildEpisodeRecords(localizedSeason, parsedLink.tmdbId, parsedLink.seasonNumber);
+
+  await applyMachineTranslationFallback([seasonRecord, ...episodeRecords], runtime.translationConfig, runtime);
+
+  const childItems = episodeRecords.map((episodeRecord) =>
+    buildChildDetailItem(
+      episodeRecord,
+      buildDetailLink({
+        mediaType: MEDIA_TYPES.TV,
+        tmdbId: parsedLink.tmdbId,
+        seasonNumber: parsedLink.seasonNumber,
+        episodeNumber: episodeRecord.episodeNumber,
+        translationConfig: runtime.translationConfig,
+      }),
+      buildDescriptionText(
+        [episodeRecord.releaseDate, `第 ${episodeRecord.episodeNumber} 集`],
+        episodeRecord.overview || '暂无简介',
+      ),
+    ));
+
+  return buildDetailItem(
+    seasonRecord,
+    parsedLink.link,
+    buildDescriptionText(
+      [seasonRecord.releaseDate, `第 ${parsedLink.seasonNumber} 季`],
+      seasonRecord.overview || '暂无简介',
+    ),
+    { childItems, genreTitle: undefined },
+  );
+}
+
+async function loadEpisodeDetailFromLink(parsedLink, runtime) {
+  const localizedEpisode = await fetchLocalizedTmdbResource(
+    `tv/${parsedLink.tmdbId}/season/${parsedLink.seasonNumber}/episode/${parsedLink.episodeNumber}`,
+    runtime,
+    { shouldFetchTraditional: shouldFetchTraditionalForEpisodeDetail },
+  );
+  const episodeRecord = buildEpisodeDetailRecord(
+    localizedEpisode,
+    parsedLink.tmdbId,
+    parsedLink.seasonNumber,
+    parsedLink.episodeNumber,
+  );
+
+  await applyMachineTranslationFallback([episodeRecord], runtime.translationConfig, runtime);
+
+  return buildDetailItem(
+    episodeRecord,
+    parsedLink.link,
+    buildDescriptionText(
+      [episodeRecord.releaseDate, `第 ${parsedLink.episodeNumber} 集`],
+      episodeRecord.overview || '暂无简介',
+    ),
+    { genreTitle: undefined },
+  );
 }
 
 function getLegacyCategoryValue(params = {}) {
@@ -1943,14 +2813,33 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
 
   await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
 
-  return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
+  return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle, runtime.translationConfig));
+}
+
+async function loadCatalogDetail(link, overrides = {}) {
+  const parsedLink = parseDetailLink(link);
+  const runtime = createRuntime(parsedLink.rawParams, overrides);
+
+  if (parsedLink.mediaType === MEDIA_TYPES.MOVIE) {
+    return loadMovieDetailFromLink(parsedLink, runtime);
+  }
+
+  if (Number.isFinite(parsedLink.episodeNumber)) {
+    return loadEpisodeDetailFromLink(parsedLink, runtime);
+  }
+
+  if (Number.isFinite(parsedLink.seasonNumber)) {
+    return loadSeasonDetailFromLink(parsedLink, runtime);
+  }
+
+  return loadSeriesDetailFromLink(parsedLink, runtime);
 }
 
 var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
-  description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.8",
+  description: '基于 TMDb 的剧集与电影分类浏览模块，支持分类墙提速、自定义详情与中文标题回退。',
+  version: "0.4.0",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -1959,7 +2848,7 @@ var WidgetMetadata = {
       id: 'tmdb-category-browser',
       type: 'video',
       title: '影视分类',
-      description: '按统一分类和排序浏览 TMDb 影视条目，支持电影与剧集合并大类。',
+      description: '按统一分类和排序浏览 TMDb 影视条目，支持电影与剧集合并大类，以及自定义中文详情页。',
       functionName: 'browseTmdbCategories',
       cacheDuration: 3600,
       params: [
@@ -2012,7 +2901,11 @@ var WidgetMetadata = {
   ],
 };
 
-// 这里不接播放链路，只负责把 TMDb 分类结果整理成 Forward Widget 可识别的条目列表。
+// 列表页只负责组织分类墙，详情页则交给下面的自定义 loadDetail 链路继续中文化。
 async function browseTmdbCategories(params) {
   return browseCatalog(params);
+}
+
+async function loadDetail(link) {
+  return loadCatalogDetail(link);
 }
