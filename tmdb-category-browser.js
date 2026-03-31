@@ -409,6 +409,16 @@ function getDefaultTmdbGet() {
   return Widget.tmdb.get.bind(Widget.tmdb);
 }
 
+function getTimerFunctions() {
+  const safeSetTimeout = typeof globalThis?.setTimeout === 'function' ? globalThis.setTimeout.bind(globalThis) : null;
+  const safeClearTimeout = typeof globalThis?.clearTimeout === 'function' ? globalThis.clearTimeout.bind(globalThis) : null;
+
+  return {
+    setTimeout: safeSetTimeout,
+    clearTimeout: safeClearTimeout,
+  };
+}
+
 function getDefaultHttpPost() {
   if (typeof Widget === 'undefined' || !Widget?.http?.post) {
     return async () => {
@@ -419,14 +429,15 @@ function getDefaultHttpPost() {
   return async (url, body, options) => {
     const { timeoutMs = TRANSLATION_HTTP_TIMEOUT_MS, ...requestOptions } = options ?? {};
     const requestPromise = Widget.http.post(url, body, requestOptions);
+    const timers = getTimerFunctions();
 
     let timeoutHandle;
     try {
-      const response = await (timeoutMs > 0
+      const response = await (timeoutMs > 0 && timers.setTimeout && timers.clearTimeout
         ? Promise.race([
           requestPromise,
           new Promise((_, reject) => {
-            timeoutHandle = setTimeout(() => {
+            timeoutHandle = timers.setTimeout(() => {
               reject(new Error(`翻译请求超时（${timeoutMs}ms）`));
             }, timeoutMs);
           }),
@@ -435,8 +446,8 @@ function getDefaultHttpPost() {
 
       return response?.data ?? response;
     } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
+      if (timeoutHandle && timers.clearTimeout) {
+        timers.clearTimeout(timeoutHandle);
       }
     }
   };
@@ -506,7 +517,13 @@ function normalizeUrl(value) {
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const timers = getTimerFunctions();
+
+  if (!timers.setTimeout || ms <= 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => timers.setTimeout(resolve, ms));
 }
 
 function buildTranslationSystemPrompt({ strict = false } = {}) {
@@ -1438,7 +1455,7 @@ async function translateTitlesWithCache(titles, translationConfig, runtime) {
       }
     }
 
-    if (index + TRANSLATION_BATCH_SIZE < missingTitles.length) {
+    if (getTimerFunctions().setTimeout && index + TRANSLATION_BATCH_SIZE < missingTitles.length) {
       await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
     }
   }
@@ -1830,7 +1847,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.6",
+  version: "0.3.7",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
