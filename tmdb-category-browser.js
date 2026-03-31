@@ -18,6 +18,7 @@ const DEFAULT_PAGE = 1;
 const MAX_COUNT = 60;
 const TMDB_PAGE_SIZE = 20;
 const MAX_SOURCE_PAGES = 5;
+const PAGINATION_FORWARD_FILL_LIMIT_PAGES = 8;
 const CACHE_MAX_BYTES = 500 * 1024 * 1024;
 const CACHE_NAMESPACE_TMDB = 'cache:tmdb';
 const CACHE_NAMESPACE_TRANSLATE = 'cache:translate';
@@ -2025,15 +2026,7 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
 }
 
 function shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse) {
-  return (simplifiedResponse?.results ?? []).some((item) => {
-    const simplifiedTitle = getRawTitle(item, mediaType);
-    if (!isUsableTmdbChineseTitle(simplifiedTitle)) {
-      return true;
-    }
-
-    const simplifiedOverview = normalizeTitle(item?.overview);
-    return Boolean(simplifiedOverview && !isUsableTmdbChineseText(simplifiedOverview));
-  });
+  return (simplifiedResponse?.results ?? []).some((item) => !isUsableTmdbChineseTitle(getRawTitle(item, mediaType)));
 }
 
 function createRuntime(rawParams, overrides = {}) {
@@ -2063,7 +2056,7 @@ async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, source
   }, runtime);
 
   let traditionalResponse = null;
-  if (shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
+  if (!isChineseCategory(categoryId) && shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
     traditionalResponse = await cachedTmdbGet(endpoint, {
       params: {
         ...commonParams,
@@ -2127,12 +2120,21 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
   return true;
 }
 
-function getProgressiveFetchPlan(params) {
-  const neededItemCount = params.page * params.count;
+function isChineseCategory(categoryId) {
+  return categoryId === 'chinese_movie' || categoryId === 'chinese_series';
+}
+
+function getRemotePaginationPlan(params) {
+  const offset = (params.page - 1) * params.count;
+  const sourceStartPage = Math.floor(offset / TMDB_PAGE_SIZE) + 1;
+  const localSkip = offset % TMDB_PAGE_SIZE;
+  const requestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
 
   return {
-    sourceStartPage: 1,
-    neededCollectedCount: neededItemCount,
+    sourceStartPage,
+    localSkip,
+    neededCollectedCount: localSkip + params.count,
+    maxRounds: requestedSourcePages + PAGINATION_FORWARD_FILL_LIMIT_PAGES,
   };
 }
 
@@ -2728,12 +2730,13 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const params = normalizeBrowseParams(rawParams);
   const runtime = createRuntime(rawParams, overrides);
   const todayDate = getTodayDateString();
+  const fetchPlan = getRemotePaginationPlan(params);
   const sourceMediaTypes = getCategoryMediaTypes(params.categoryId);
   const selectedScopes = sourceMediaTypes
     .map((mediaType) => ({
       mediaType,
       rule: getRuleById(mediaType, params.categoryId),
-      nextPage: 1,
+      nextPage: fetchPlan.sourceStartPage,
       totalPages: 0,
       exhausted: false,
     }))
@@ -2743,13 +2746,14 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     throw new Error(`未知分类：${params.categoryId}`);
   }
 
-  const fetchPlan = getProgressiveFetchPlan(params);
   const collected = [];
   const seenRecordKeys = new Set();
+  let fetchedRounds = 0;
 
-  // 统一按“轮次”并行抓取所有相关媒体源。
-  // 这样纪录片、演唱会这类跨 movie/tv 的大类可以在同一个排序集合里先合并、再分页。
-  while (selectedScopes.some((scope) => !scope.exhausted)) {
+  // 统一按“当前页窗口 + 顺延补抓”的思路抓取。
+  // 不再为后页请求回头重扫第 1 页，避免翻页越翻越慢。
+  while (selectedScopes.some((scope) => !scope.exhausted) && fetchedRounds < fetchPlan.maxRounds) {
+    fetchedRounds += 1;
     const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
     const pageResults = await Promise.all(
       activeScopes.map((scope) =>
@@ -2806,12 +2810,14 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   }
 
   const sorted = sortCatalogRecords(collected, params.sortKey);
-  const startIndex = (params.page - 1) * params.count;
+  const startIndex = fetchPlan.localSkip;
   const endIndex = startIndex + params.count;
   const categoryTitle = selectedScopes[0].rule.title;
   const pagedRecords = sorted.slice(startIndex, endIndex);
 
-  await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
+  if (!isChineseCategory(params.categoryId)) {
+    await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
+  }
 
   return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle, runtime.translationConfig));
 }
@@ -2839,7 +2845,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持分类墙提速、自定义详情与中文标题回退。',
-  version: "0.4.0",
+  version: "0.4.1",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
