@@ -90,6 +90,13 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
   },
 ]);
 
+const GLOBAL_PARAM_DEFAULTS = Object.freeze(
+  GLOBAL_PARAM_OPTIONS.reduce((result, option) => {
+    result[option.name] = typeof option.value === 'string' ? option.value : '';
+    return result;
+  }, {}),
+);
+
 const CONCERT_KEYWORDS = Object.freeze([
   '演唱会',
   '演唱會',
@@ -659,10 +666,21 @@ function getRawAdultFlag(item) {
 }
 
 function normalizeTranslationConfig(params = {}) {
+  // Forward 在部分场景只透传用户显式填写过的全局参数，
+  // 不会把 metadata 里的默认值一并带进函数参数；这里主动补齐默认值。
   return {
-    baseUrl: normalizeUrl(params[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL]),
-    token: normalizeTitle(params[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN]),
-    model: normalizeTitle(params[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL]),
+    baseUrl: normalizeUrl(
+      params[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL]
+      ?? GLOBAL_PARAM_DEFAULTS[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL],
+    ),
+    token: normalizeTitle(
+      params[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN]
+      ?? GLOBAL_PARAM_DEFAULTS[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN],
+    ),
+    model: normalizeTitle(
+      params[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL]
+      ?? GLOBAL_PARAM_DEFAULTS[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL],
+    ),
   };
 }
 
@@ -1675,7 +1693,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.1",
+  version: "0.3.2",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
