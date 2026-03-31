@@ -30,7 +30,8 @@ const CACHE_MANIFEST_KEY = 'cache:manifest:v1';
 const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
 const TRANSLATION_BATCH_SIZE = 20;
-const TRANSLATION_PROMPT_VERSION = 'v1';
+const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
+const TRANSLATION_PROMPT_VERSION = 'v2';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 5,
   rating: 20,
@@ -70,16 +71,16 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_MODEL,
     title: '翻译模型名',
     type: 'input',
-    value: 'Qwen/Qwen3.5-4B',
+    value: 'Qwen/Qwen2.5-7B-Instruct',
     description: '例如 gpt-4.1-mini、qwen-plus、deepseek-chat',
     placeholders: [
       {
-        title: 'gpt-4.1-mini',
-        value: 'gpt-4.1-mini',
+        title: 'Qwen/Qwen2.5-7B-Instruct',
+        value: 'Qwen/Qwen2.5-7B-Instruct',
       },
       {
-        title: 'qwen-plus',
-        value: 'qwen-plus',
+        title: 'Qwen/Qwen3.5-4B',
+        value: 'Qwen/Qwen3.5-4B',
       },
       {
         title: 'deepseek-chat',
@@ -428,8 +429,28 @@ function getDefaultHttpPost() {
   }
 
   return async (url, body, options) => {
-    const response = await Widget.http.post(url, body, options);
-    return response?.data ?? response;
+    const { timeoutMs = TRANSLATION_HTTP_TIMEOUT_MS, ...requestOptions } = options ?? {};
+    const requestPromise = Widget.http.post(url, body, requestOptions);
+
+    let timeoutHandle;
+    try {
+      const response = await (timeoutMs > 0
+        ? Promise.race([
+          requestPromise,
+          new Promise((_, reject) => {
+            timeoutHandle = setTimeout(() => {
+              reject(new Error(`翻译请求超时（${timeoutMs}ms）`));
+            }, timeoutMs);
+          }),
+        ])
+        : requestPromise);
+
+      return response?.data ?? response;
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
   };
 }
 
@@ -539,6 +560,15 @@ function buildCacheStorageKey(namespace, payload) {
 function buildOpenAiChatCompletionsUrl(baseUrl) {
   const normalized = normalizeUrl(baseUrl);
   return normalized.endsWith('/chat/completions') ? normalized : `${normalized}/chat/completions`;
+}
+
+function modelSupportsThinkingToggle(model) {
+  const normalized = normalizeTitle(model).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return normalized.includes('qwen3') || normalized.includes('deepseek-r1') || normalized.includes('qwq');
 }
 
 function parseJsonSafely(value) {
@@ -1131,31 +1161,38 @@ async function requestTranslationBatch(titles, translationConfig, runtime) {
     throw new Error('翻译代理返回格式异常');
   }
 
+  const requestBody = {
+    model: translationConfig.model,
+    temperature: 0.1,
+    max_tokens: 160,
+    response_format: {
+      type: 'json_object',
+    },
+    messages: [
+      {
+        role: 'system',
+        content:
+          '你是影视标题翻译器。请只把输入标题翻译成简体中文片名/剧名。不要解释，不要扩写，不要保留编号。只输出 JSON，对象中只能包含 translations 数组。',
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({ translations: titles }),
+      },
+    ],
+  };
+
+  if (modelSupportsThinkingToggle(translationConfig.model)) {
+    requestBody.enable_thinking = false;
+  }
+
   const response = await runtime.httpPost(
     buildOpenAiChatCompletionsUrl(translationConfig.baseUrl),
-    {
-      model: translationConfig.model,
-      temperature: 0.2,
-      max_tokens: 512,
-      messages: [
-        {
-          role: 'system',
-          content:
-            '你是影视标题翻译器。请只把输入标题翻译成简体中文片名/剧名。不要解释，不要扩写，不要保留编号。输出 JSON：{"translations":["标题1","标题2"]}',
-        },
-        {
-          role: 'user',
-          content: JSON.stringify({
-            task: 'translate_titles_to_simplified_chinese',
-            titles,
-          }),
-        },
-      ],
-    },
+    requestBody,
     {
       headers: {
         Authorization: `Bearer ${translationConfig.token}`,
       },
+      timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
     },
   );
 
@@ -1638,7 +1675,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.0",
+  version: "0.3.1",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
