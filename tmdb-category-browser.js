@@ -1646,7 +1646,7 @@ async function requestTranslationBatch(items, translationConfig, runtime, { stri
 
   const requestBody = {
     model: translationConfig.model,
-    temperature: 0.1,
+    temperature: 0,
     max_tokens: 160,
     response_format: {
       type: 'json_object',
@@ -1731,7 +1731,7 @@ async function requestOverviewBatch(items, translationConfig, runtime) {
 
   const requestBody = {
     model: effectiveConfig.model,
-    temperature: 0.1,
+    temperature: 0,
     max_tokens: 400,
     response_format: {
       type: 'json_object',
@@ -3008,7 +3008,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.1",
+  version: "0.5.2",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
