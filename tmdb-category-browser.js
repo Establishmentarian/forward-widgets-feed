@@ -24,19 +24,34 @@ const CACHE_NAMESPACE_TRANSLATE = 'cache:translate';
 const CACHE_MANIFEST_KEY = 'cache:manifest:v1';
 const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
-const TRANSLATION_BATCH_SIZE = 20;
+const TRANSLATION_FAILURE_CACHE_TTL_SECONDS = 6 * 60 * 60;
+const TRANSLATION_BATCH_SIZE = 4;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
 const TRANSLATION_INTER_BATCH_DELAY_MS = 350;
 const TRANSLATION_MAX_ATTEMPTS = 2;
-const TRANSLATION_PROMPT_VERSION = 'v5';
+const TRANSLATION_PROMPT_VERSION = 'v6';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
+  strictForeignDate: 3,
 });
 const TMDB_WEB_BASE = 'https://www.themoviedb.org';
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const TMDB_LANGUAGE_SIMPLIFIED = 'zh-CN';
 const TMDB_LANGUAGE_TRADITIONAL = 'zh-TW';
+const DEFAULT_FALLBACK_TRANSLATION_CONFIG = Object.freeze({
+  baseUrl: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
+  token: '',
+  model: 'Qwen/Qwen2.5-7B-Instruct',
+});
+const STRICT_FOREIGN_CATEGORY_IDS = Object.freeze([
+  'western_movie',
+  'western_series',
+  'asia_pacific_movie',
+  'asia_pacific_series',
+  'documentary',
+  'concert',
+]);
 const GLOBAL_PARAM_KEYS = Object.freeze({
   TRANSLATION_API_BASE_URL: 'translationApiBaseUrl',
   TRANSLATION_API_TOKEN: 'translationApiToken',
@@ -48,9 +63,13 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL,
     title: '翻译接口 Base URL',
     type: 'input',
-    value: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
-    description: '可填 OpenAI 兼容接口根路径，或你的翻译代理 Worker URL',
+    value: 'https://api.astrocean.space/v1',
+    description: '默认预填 Astrocean OpenAI 兼容接口，可自行改成其他兼容服务。',
     placeholders: [
+      {
+        title: 'https://api.astrocean.space/v1',
+        value: 'https://api.astrocean.space/v1',
+      },
       {
         title: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
         value: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
@@ -61,27 +80,27 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN,
     title: '翻译接口 Token',
     type: 'input',
-    value: '',
-    description: '直连 OpenAI 兼容接口时填写；走代理 Worker 时可留空。',
+    value: 'sk-aef500db7c237d99f5b00830d9a6d82cd1d74e5a83679d412e488ed7adbc314c',
+    description: '默认预填 Astrocean Token；改用代理 Worker 时可留空。',
   },
   {
     name: GLOBAL_PARAM_KEYS.TRANSLATION_MODEL,
     title: '翻译模型名',
     type: 'input',
-    value: 'Qwen/Qwen3.5-4B',
-    description: '例如 gpt-4.1-mini、qwen-plus、deepseek-chat',
+    value: 'gpt-5.4-nano',
+    description: '默认使用速度优先的 gpt-5.4-nano，可自行改成其他兼容模型。',
     placeholders: [
       {
-        title: 'Qwen/Qwen3.5-4B',
-        value: 'Qwen/Qwen3.5-4B',
+        title: 'gpt-5.4-nano',
+        value: 'gpt-5.4-nano',
+      },
+      {
+        title: 'gpt-5.4-mini',
+        value: 'gpt-5.4-mini',
       },
       {
         title: 'Qwen/Qwen2.5-7B-Instruct',
         value: 'Qwen/Qwen2.5-7B-Instruct',
-      },
-      {
-        title: 'deepseek-chat',
-        value: 'deepseek-chat',
       },
     ],
   },
@@ -97,17 +116,24 @@ const GLOBAL_PARAM_DEFAULTS = Object.freeze(
 const CONCERT_KEYWORDS = Object.freeze([
   '演唱会',
   '演唱會',
+  'Concert',
+  'concert',
   'Live',
   'LIVE',
-  'Concert',
+  'live',
   '巡回演唱会',
   '巡迴演唱會',
   '世界巡演',
-  '世界巡演',
+  '巡演',
   '演奏会',
   '演奏會',
   '音乐会',
   '音樂會',
+  'in concert',
+  'live at',
+  'live from',
+  'world tour',
+  'performance',
   '晚会',
   '晚會',
 ]);
@@ -178,8 +204,12 @@ const MOVIE_RULES = Object.freeze([
   {
     id: 'concert',
     title: '演唱会',
-    match: {
+    keywordOnly: true,
+    discover: {
       genreIds: Object.freeze([10402]),
+    },
+    match: {
+      titleKeywords: CONCERT_KEYWORDS,
     },
   },
   {
@@ -528,8 +558,8 @@ function sleep(ms) {
 
 function buildTranslationSystemPrompt({ strict = false } = {}) {
   return strict
-    ? '你是影视标题翻译器。请把输入标题统一转换为简体中文片名/剧名。若没有官方中译名，也必须按常见译法或音译生成中文，不要保留英文、法文、西语、日语罗马字等拉丁字母原文。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。'
-    : '你是影视标题翻译器。请只把输入标题翻译成简体中文片名/剧名。若标题是人名、地名或专有名词，请给出简体中文音译，不要直接保留外文原文。只输出 JSON，对象中只能包含 translations 数组。';
+    ? '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题统一转换为自然、简体中文片名或剧名。若没有官方中译名，也必须给出常见中文译名或简洁音译，不要保留英文、法文、西语、德语、俄语、韩语罗马字或其他非中文原文。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。'
+    : '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题翻译成自然、简体中文片名或剧名。若 title 只是外文别名，originalTitle 仅用于辅助判断。若没有官方中译名，请给出常见中文译名或简洁音译。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。';
 }
 
 function stableStringify(value) {
@@ -575,6 +605,26 @@ function buildCacheStorageKey(namespace, payload) {
 function buildOpenAiChatCompletionsUrl(baseUrl) {
   const normalized = normalizeUrl(baseUrl);
   return normalized.endsWith('/chat/completions') ? normalized : `${normalized}/chat/completions`;
+}
+
+function looksLikeTranslationProxyBaseUrl(baseUrl) {
+  const normalized = normalizeUrl(baseUrl);
+
+  if (!normalized) {
+    return false;
+  }
+
+  try {
+    const url = new URL(normalized);
+    const normalizedPath = url.pathname.replace(/\/+$/, '');
+    const hostLooksLikeWorker = url.hostname.endsWith('.workers.dev') || url.hostname.includes('translation-proxy');
+    const pathLooksLikeProxy = !normalizedPath || normalizedPath === '/' || normalizedPath.includes('translation-proxy');
+    const looksLikeOpenAiEndpoint = normalizedPath.endsWith('/v1') || normalizedPath.endsWith('/chat/completions');
+
+    return (hostLooksLikeWorker || pathLooksLikeProxy) && !looksLikeOpenAiEndpoint;
+  } catch {
+    return normalized.includes('translation-proxy');
+  }
 }
 
 function modelSupportsThinkingToggle(model) {
@@ -731,12 +781,26 @@ function normalizeTranslationConfig(params = {}) {
   };
 }
 
+function buildFallbackTranslationConfig() {
+  return {
+    baseUrl: normalizeUrl(DEFAULT_FALLBACK_TRANSLATION_CONFIG.baseUrl),
+    token: normalizeTitle(DEFAULT_FALLBACK_TRANSLATION_CONFIG.token),
+    model: normalizeTitle(DEFAULT_FALLBACK_TRANSLATION_CONFIG.model),
+  };
+}
+
 function hasTranslationConfig(config) {
   return Boolean(config?.baseUrl && config?.model);
 }
 
 function isTranslationProxyMode(config) {
-  return Boolean(config?.baseUrl && config?.model && !config?.token);
+  // Forward 会把 metadata 的默认 token 一起透传进来；
+  // 当用户把 Base URL 改成 Worker 代理时，不能因为默认 token 还在就误判成 OpenAI 直连。
+  return Boolean(
+    config?.baseUrl
+      && config?.model
+      && (!config?.token || looksLikeTranslationProxyBaseUrl(config.baseUrl)),
+  );
 }
 
 function isUsableTmdbChineseTitle(title) {
@@ -754,6 +818,20 @@ function getMachineTranslationSourceTitle(record) {
     || normalizeTitle(record.simplifiedTitle)
     || normalizeTitle(record.traditionalTitle)
     || normalizeTitle(record.originalTitle);
+}
+
+function buildTranslationJob(record) {
+  const title = getMachineTranslationSourceTitle(record);
+  const originalTitle = normalizeTitle(record.originalTitle) || title;
+
+  return {
+    title,
+    originalTitle,
+    jobKey: stableStringify({
+      title,
+      originalTitle,
+    }),
+  };
 }
 
 function shouldAttemptMachineTranslation(record) {
@@ -810,11 +888,17 @@ function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle 
   return primary;
 }
 
-function getTitleCandidates(record) {
+function getKeywordCandidates(record) {
   return Array.from(
     new Set(
-      [record.displayTitle, record.simplifiedTitle, record.traditionalTitle, record.originalTitle]
-        .map((title) => normalizeTitle(title))
+      [
+        record.displayTitle,
+        record.simplifiedTitle,
+        record.traditionalTitle,
+        record.originalTitle,
+        record.overview,
+      ]
+        .map((value) => normalizeTitle(value))
         .filter(Boolean),
     ),
   );
@@ -853,8 +937,8 @@ function matchesRule(record, rule) {
   }
 
   if (match.titleKeywords?.length) {
-    const titleCandidates = getTitleCandidates(record);
-    const hasKeyword = match.titleKeywords.some((keyword) => matchesKeyword(titleCandidates, keyword));
+    const keywordCandidates = getKeywordCandidates(record);
+    const hasKeyword = match.titleKeywords.some((keyword) => matchesKeyword(keywordCandidates, keyword));
     if (!hasKeyword) {
       return false;
     }
@@ -864,22 +948,23 @@ function matchesRule(record, rule) {
 }
 
 function buildRuleDiscoverParams(rule) {
-  if (rule.catchAll || rule.keywordOnly) {
+  if (rule.catchAll) {
     return {};
   }
 
+  const discover = rule.discover ?? (rule.keywordOnly ? {} : rule.match);
   const params = {};
 
-  if (rule.match.genreIds?.length) {
-    params.with_genres = buildOrQuery(rule.match.genreIds);
+  if (discover.genreIds?.length) {
+    params.with_genres = buildOrQuery(discover.genreIds);
   }
 
-  if (rule.match.originalLanguages?.length) {
-    params.with_original_language = buildOrQuery(rule.match.originalLanguages);
+  if (discover.originalLanguages?.length) {
+    params.with_original_language = buildOrQuery(discover.originalLanguages);
   }
 
-  if (rule.match.originCountries?.length) {
-    params.with_origin_country = buildOrQuery(rule.match.originCountries);
+  if (discover.originCountries?.length) {
+    params.with_origin_country = buildOrQuery(discover.originCountries);
   }
 
   return params;
@@ -928,10 +1013,16 @@ function buildGenreText(genreIds, mediaType) {
   return genres.join(' / ');
 }
 
-function getMinimumVoteCount(sortKey) {
-  return sortKey === SORT_KEYS.RATING_ASC || sortKey === SORT_KEYS.RATING_DESC
-    ? MIN_DISCOVER_VOTE_COUNT.rating
-    : MIN_DISCOVER_VOTE_COUNT.default;
+function getMinimumVoteCount(categoryId, sortKey) {
+  if (sortKey === SORT_KEYS.RATING_ASC || sortKey === SORT_KEYS.RATING_DESC) {
+    return MIN_DISCOVER_VOTE_COUNT.rating;
+  }
+
+  if (STRICT_FOREIGN_CATEGORY_IDS.includes(categoryId)) {
+    return MIN_DISCOVER_VOTE_COUNT.strictForeignDate;
+  }
+
+  return MIN_DISCOVER_VOTE_COUNT.default;
 }
 
 function getTmdbSortBy(mediaType, sortKey) {
@@ -1204,13 +1295,37 @@ async function cachedTmdbGet(path, options, runtime) {
   return response;
 }
 
-async function requestTranslationBatch(titles, translationConfig, runtime) {
+function buildTranslationItemsPayload(items) {
+  return items.map((item) => ({
+    title: item.title,
+    originalTitle: item.originalTitle,
+  }));
+}
+
+function buildTranslationCacheKey(job, primaryConfig, fallbackConfig) {
+  return buildCacheStorageKey(CACHE_NAMESPACE_TRANSLATE, {
+    primaryBaseUrl: primaryConfig?.baseUrl ?? '',
+    primaryModel: primaryConfig?.model ?? '',
+    fallbackBaseUrl: fallbackConfig?.baseUrl ?? '',
+    fallbackModel: fallbackConfig?.model ?? '',
+    promptVersion: TRANSLATION_PROMPT_VERSION,
+    title: job.title,
+    originalTitle: job.originalTitle,
+  });
+}
+
+async function requestTranslationBatch(items, translationConfig, runtime, { strict = false } = {}) {
+  if (!items.length) {
+    return [];
+  }
+
   if (isTranslationProxyMode(translationConfig)) {
     const response = await runtime.httpPost(
       normalizeUrl(translationConfig.baseUrl),
       {
-        titles,
+        items: buildTranslationItemsPayload(items),
         model: translationConfig.model,
+        strict,
       },
       {
         headers: {
@@ -1236,11 +1351,11 @@ async function requestTranslationBatch(titles, translationConfig, runtime) {
     messages: [
       {
         role: 'system',
-        content: buildTranslationSystemPrompt(),
+        content: buildTranslationSystemPrompt({ strict }),
       },
       {
         role: 'user',
-        content: JSON.stringify({ translations: titles }),
+        content: JSON.stringify({ items: buildTranslationItemsPayload(items) }),
       },
     ],
   };
@@ -1261,104 +1376,26 @@ async function requestTranslationBatch(titles, translationConfig, runtime) {
   );
 
   const content = response?.choices?.[0]?.message?.content ?? '';
-  const parsedTranslations = parseTranslationResponseContent(content, titles.length);
+  const parsedTranslations = parseTranslationResponseContent(content, items.length);
 
-  return titles.map((title, index) => normalizeTitle(parsedTranslations[index]) || title);
+  return items.map((item, index) => normalizeTitle(parsedTranslations[index]) || item.title);
 }
 
-async function requestStrictTranslationRetry(titles, translationConfig, runtime) {
-  if (!titles.length) {
-    return [];
+async function requestTranslationBatchWithBackoff(batch, translationConfig, runtime, { strict = false } = {}) {
+  if (!hasTranslationConfig(translationConfig)) {
+    return {
+      translatedBatch: batch.map((item) => item.title),
+      requestSucceeded: false,
+      error: null,
+    };
   }
 
-  if (isTranslationProxyMode(translationConfig)) {
-    const response = await runtime.httpPost(
-      normalizeUrl(translationConfig.baseUrl),
-      {
-        titles,
-        model: translationConfig.model,
-        strict: true,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      },
-    );
-
-    if (Array.isArray(response?.translations)) {
-      return response.translations.map((value) => normalizeTitle(String(value)));
-    }
-
-    throw new Error('翻译代理严格重试返回格式异常');
-  }
-
-  const requestBody = {
-    model: translationConfig.model,
-    temperature: 0.1,
-    max_tokens: 160,
-    response_format: {
-      type: 'json_object',
-    },
-    messages: [
-      {
-        role: 'system',
-        content: buildTranslationSystemPrompt({ strict: true }),
-      },
-      {
-        role: 'user',
-        content: JSON.stringify({ translations: titles }),
-      },
-    ],
-  };
-
-  if (modelSupportsThinkingToggle(translationConfig.model)) {
-    requestBody.enable_thinking = false;
-  }
-
-  const response = await runtime.httpPost(
-    buildOpenAiChatCompletionsUrl(translationConfig.baseUrl),
-    requestBody,
-    {
-      headers: {
-        Authorization: `Bearer ${translationConfig.token}`,
-      },
-      timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
-    },
-  );
-
-  const content = response?.choices?.[0]?.message?.content ?? '';
-  const parsedTranslations = parseTranslationResponseContent(content, titles.length);
-
-  return titles.map((title, index) => normalizeTitle(parsedTranslations[index]) || title);
-}
-
-async function requestTranslationBatchWithBackoff(batch, translationConfig, runtime) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
     try {
-      let translatedBatch = await requestTranslationBatch(batch, translationConfig, runtime);
-      const untranslatedEntries = collectUntranslatedEntries(batch, translatedBatch);
-
-      if (untranslatedEntries.length) {
-        const retriedBatch = await requestStrictTranslationRetry(
-          untranslatedEntries.map((entry) => entry.title),
-          translationConfig,
-          runtime,
-        );
-
-        for (const [retryIndex, unresolvedEntry] of untranslatedEntries.entries()) {
-          const retriedTitle = normalizeTitle(retriedBatch[retryIndex]);
-
-          if (isUsableTranslatedChineseTitle(retriedTitle)) {
-            translatedBatch[unresolvedEntry.index] = retriedTitle;
-          }
-        }
-      }
-
       return {
-        translatedBatch,
+        translatedBatch: await requestTranslationBatch(batch, translationConfig, runtime, { strict }),
         requestSucceeded: true,
       };
     } catch (error) {
@@ -1381,13 +1418,13 @@ async function requestTranslationBatchWithBackoff(batch, translationConfig, runt
 
 function collectUntranslatedEntries(batch, translatedBatch) {
   return batch
-    .map((title, index) => ({
-      title,
-      translatedTitle: normalizeTitle(translatedBatch[index]) || title,
+    .map((item, index) => ({
+      job: item,
+      translatedTitle: normalizeTitle(translatedBatch[index]) || item.title,
       index,
     }))
-    .filter(({ title, translatedTitle }) => {
-      const normalizedSource = normalizeTitle(title);
+    .filter(({ job, translatedTitle }) => {
+      const normalizedSource = normalizeTitle(job.title);
 
       if (!normalizedSource) {
         return false;
@@ -1401,61 +1438,125 @@ function collectUntranslatedEntries(batch, translatedBatch) {
     });
 }
 
-async function translateTitlesWithCache(titles, translationConfig, runtime) {
-  if (!hasTranslationConfig(translationConfig) || !titles.length) {
+async function translateSingleJobWithFallback(job, primaryConfig, runtime) {
+  let translatedTitle = '';
+  let requestSucceeded = false;
+
+  if (hasTranslationConfig(primaryConfig)) {
+    const primaryResult = await requestTranslationBatchWithBackoff([job], primaryConfig, runtime, { strict: true });
+    const primaryTitle = normalizeTitle(primaryResult.translatedBatch[0]) || job.title;
+
+    if (isUsableTranslatedChineseTitle(primaryTitle)) {
+      return {
+        translatedTitle: primaryTitle,
+        requestSucceeded: primaryResult.requestSucceeded,
+      };
+    }
+
+    requestSucceeded = requestSucceeded || primaryResult.requestSucceeded;
+  }
+
+  if (hasTranslationConfig(runtime.fallbackTranslationConfig)) {
+    const fallbackResult = await requestTranslationBatchWithBackoff(
+      [job],
+      runtime.fallbackTranslationConfig,
+      runtime,
+      { strict: true },
+    );
+    translatedTitle = normalizeTitle(fallbackResult.translatedBatch[0]) || job.title;
+    requestSucceeded = requestSucceeded || fallbackResult.requestSucceeded;
+
+    if (isUsableTranslatedChineseTitle(translatedTitle)) {
+      return {
+        translatedTitle,
+        requestSucceeded,
+      };
+    }
+  }
+
+  return {
+    translatedTitle: '',
+    requestSucceeded,
+  };
+}
+
+async function translateTitlesWithCache(jobs, translationConfig, runtime) {
+  if (!jobs.length) {
     return new Map();
   }
 
-  const uniqueTitles = Array.from(new Set(titles.map((title) => normalizeTitle(title)).filter(Boolean)));
+  const dedupedJobs = Array.from(
+    new Map(
+      jobs
+        .filter((job) => isMeaningfulText(job?.title))
+        .map((job) => [job.jobKey, job]),
+    ).values(),
+  );
   const translatedMap = new Map();
-  const missingTitles = [];
+  const missingJobs = [];
 
-  for (const title of uniqueTitles) {
-    const cacheKey = buildCacheStorageKey(CACHE_NAMESPACE_TRANSLATE, {
-      baseUrl: translationConfig.baseUrl,
-      model: translationConfig.model,
-      promptVersion: TRANSLATION_PROMPT_VERSION,
-      title,
-    });
+  for (const job of dedupedJobs) {
+    const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
     const cachedValue = await getCachedJsonValue(runtime.cacheState, cacheKey);
 
     if (cachedValue?.translatedTitle) {
-      translatedMap.set(title, normalizeTitle(cachedValue.translatedTitle));
+      translatedMap.set(job.jobKey, normalizeTitle(cachedValue.translatedTitle));
       continue;
     }
 
-    missingTitles.push(title);
+    if (cachedValue?.status === 'failed') {
+      continue;
+    }
+
+    missingJobs.push(job);
   }
 
-  for (let index = 0; index < missingTitles.length; index += TRANSLATION_BATCH_SIZE) {
-    const batch = missingTitles.slice(index, index + TRANSLATION_BATCH_SIZE);
-    const { translatedBatch, requestSucceeded } = await requestTranslationBatchWithBackoff(
-      batch,
-      translationConfig,
-      runtime,
-    );
+  for (let index = 0; index < missingJobs.length; index += TRANSLATION_BATCH_SIZE) {
+    const batch = missingJobs.slice(index, index + TRANSLATION_BATCH_SIZE);
+    const { translatedBatch, requestSucceeded } = hasTranslationConfig(translationConfig)
+      ? await requestTranslationBatchWithBackoff(
+        batch,
+        translationConfig,
+        runtime,
+      )
+      : {
+        translatedBatch: batch.map((job) => job.title),
+        requestSucceeded: false,
+      };
+    const unresolvedEntries = collectUntranslatedEntries(batch, translatedBatch);
 
-    for (const [batchIndex, title] of batch.entries()) {
-      const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || title;
-      translatedMap.set(title, translatedTitle);
+    for (const [batchIndex, job] of batch.entries()) {
+      const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || job.title;
+      const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
 
-      const cacheKey = buildCacheStorageKey(CACHE_NAMESPACE_TRANSLATE, {
-        baseUrl: translationConfig.baseUrl,
-        model: translationConfig.model,
-        promptVersion: TRANSLATION_PROMPT_VERSION,
-        title,
-      });
-
-      if (requestSucceeded && shouldPersistTranslatedTitle(title, translatedTitle)) {
-        await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle }, {
+      if (!unresolvedEntries.some((entry) => entry.job.jobKey === job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
+        translatedMap.set(job.jobKey, translatedTitle);
+        await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle, status: 'success' }, {
           namespace: CACHE_NAMESPACE_TRANSLATE,
           ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
+          maxBytes: runtime.cacheMaxBytes,
+        }).catch(() => {});
+        continue;
+      }
+
+      const singleResult = await translateSingleJobWithFallback(job, translationConfig, runtime);
+      if (isUsableTranslatedChineseTitle(singleResult.translatedTitle)) {
+        translatedMap.set(job.jobKey, singleResult.translatedTitle);
+        await setCachedJsonValue(runtime.cacheState, cacheKey, { translatedTitle: singleResult.translatedTitle, status: 'success' }, {
+          namespace: CACHE_NAMESPACE_TRANSLATE,
+          ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
+          maxBytes: runtime.cacheMaxBytes,
+        }).catch(() => {});
+      } else {
+        await setCachedJsonValue(runtime.cacheState, cacheKey, { status: 'failed' }, {
+          namespace: CACHE_NAMESPACE_TRANSLATE,
+          ttlSeconds: TRANSLATION_FAILURE_CACHE_TTL_SECONDS,
           maxBytes: runtime.cacheMaxBytes,
         }).catch(() => {});
       }
     }
 
-    if (getTimerFunctions().setTimeout && index + TRANSLATION_BATCH_SIZE < missingTitles.length) {
+    if (getTimerFunctions().setTimeout && index + TRANSLATION_BATCH_SIZE < missingJobs.length) {
       await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
     }
   }
@@ -1470,21 +1571,21 @@ async function applyMachineTranslationFallback(records, translationConfig, runti
     return records;
   }
 
-  const translationSourceByRecordKey = new Map(
-    translationTargets.map((record) => [`${record.mediaType}:${record.tmdbId}`, getMachineTranslationSourceTitle(record)]),
+  const translationJobByRecordKey = new Map(
+    translationTargets.map((record) => [`${record.mediaType}:${record.tmdbId}`, buildTranslationJob(record)]),
   );
 
   const translatedMap = await translateTitlesWithCache(
     translationTargets
-      .map((record) => translationSourceByRecordKey.get(`${record.mediaType}:${record.tmdbId}`))
-      .filter(Boolean),
+      .map((record) => translationJobByRecordKey.get(`${record.mediaType}:${record.tmdbId}`))
+      .filter((job) => isMeaningfulText(job?.title)),
     translationConfig,
     runtime,
   );
 
   for (const record of translationTargets) {
-    const translationSourceTitle = translationSourceByRecordKey.get(`${record.mediaType}:${record.tmdbId}`);
-    const translatedTitle = translatedMap.get(translationSourceTitle);
+    const translationJob = translationJobByRecordKey.get(`${record.mediaType}:${record.tmdbId}`);
+    const translatedTitle = translatedMap.get(translationJob?.jobKey);
 
     if (isMeaningfulText(translatedTitle)) {
       record.displayTitle = translatedTitle;
@@ -1494,12 +1595,12 @@ async function applyMachineTranslationFallback(records, translationConfig, runti
   return records;
 }
 
-function buildDiscoverParams(mediaType, rule, sortKey, sourcePage, todayDate) {
+function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate) {
   const params = {
     include_adult: false,
     page: sourcePage,
     sort_by: getTmdbSortBy(mediaType, sortKey),
-    'vote_count.gte': getMinimumVoteCount(sortKey),
+    'vote_count.gte': getMinimumVoteCount(categoryId, sortKey),
     'vote_average.gte': 0.1,
     ...buildRuleDiscoverParams(rule),
   };
@@ -1525,12 +1626,13 @@ function createRuntime(rawParams, overrides = {}) {
     cacheMaxBytes,
     cacheState: createCacheState(storage, cacheMaxBytes),
     translationConfig: normalizeTranslationConfig(rawParams),
+    fallbackTranslationConfig: buildFallbackTranslationConfig(),
   };
 }
 
-async function fetchLocalizedPage({ mediaType, rule, sortKey, sourcePage, runtime, todayDate }) {
+async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
-  const commonParams = buildDiscoverParams(mediaType, rule, sortKey, sourcePage, todayDate);
+  const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
 
   const [simplifiedResponse, traditionalResponse] = await Promise.all([
     cachedTmdbGet(endpoint, {
@@ -1578,7 +1680,7 @@ function isRecordReleased(record, todayDate) {
   return record.releaseDate <= todayDate;
 }
 
-function isAllowedRecord(record, todayDate, sortKey) {
+function isAllowedRecord(record, todayDate, categoryId, sortKey) {
   if (!isRecordReleased(record, todayDate)) {
     return false;
   }
@@ -1587,7 +1689,7 @@ function isAllowedRecord(record, todayDate, sortKey) {
     return false;
   }
 
-  if (!Number.isFinite(record.voteCount) || record.voteCount < getMinimumVoteCount(sortKey)) {
+  if (!Number.isFinite(record.voteCount) || record.voteCount < getMinimumVoteCount(categoryId, sortKey)) {
     return false;
   }
 
@@ -1783,6 +1885,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       activeScopes.map((scope) =>
         fetchLocalizedPage({
           mediaType: scope.mediaType,
+          categoryId: params.categoryId,
           rule: scope.rule,
           sortKey: params.sortKey,
           sourcePage: scope.nextPage,
@@ -1797,7 +1900,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       scope.totalPages = totalPages;
 
       for (const record of results) {
-        if (!isAllowedRecord(record, todayDate, params.sortKey)) {
+        if (!isAllowedRecord(record, todayDate, params.categoryId, params.sortKey)) {
           continue;
         }
 
@@ -1847,7 +1950,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.7",
+  version: "0.3.8",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
