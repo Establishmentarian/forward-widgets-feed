@@ -517,12 +517,68 @@ function buildOrQuery(values) {
   return values.map((value) => String(value)).join('|');
 }
 
+function createObjectFromEntries(entries) {
+  const result = {};
+
+  for (const [key, value] of entries) {
+    result[key] = value;
+  }
+
+  return result;
+}
+
 function stringifyParams(rawParams) {
-  return Object.fromEntries(
+  return createObjectFromEntries(
     Object.entries(rawParams)
       .filter(([, value]) => value !== undefined && value !== null && value !== '')
       .map(([key, value]) => [key, String(value)]),
   );
+}
+
+function buildQueryString(rawParams) {
+  return Object.entries(rawParams ?? {})
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${encodeURIComponent(String(key))}=${encodeURIComponent(String(value))}`)
+    .join('&');
+}
+
+function decodeQueryComponent(value) {
+  const normalizedValue = String(value ?? '').replace(/\+/g, '%20');
+
+  try {
+    return decodeURIComponent(normalizedValue);
+  } catch {
+    return normalizedValue;
+  }
+}
+
+function parseQueryString(queryString) {
+  const normalizedQuery = normalizeTitle(queryString).replace(/^\?/, '');
+
+  if (!normalizedQuery) {
+    return {};
+  }
+
+  const result = {};
+
+  for (const segment of normalizedQuery.split('&')) {
+    if (!segment) {
+      continue;
+    }
+
+    const separatorIndex = segment.indexOf('=');
+    const rawKey = separatorIndex === -1 ? segment : segment.slice(0, separatorIndex);
+    const rawValue = separatorIndex === -1 ? '' : segment.slice(separatorIndex + 1);
+    const key = decodeQueryComponent(rawKey);
+
+    if (!key) {
+      continue;
+    }
+
+    result[key] = decodeQueryComponent(rawValue);
+  }
+
+  return result;
 }
 
 function escapeRegExp(value) {
@@ -1421,7 +1477,7 @@ async function setCachedJsonValueFromRuntime(runtime, cacheKey, value, options) 
 async function cachedTmdbGet(path, options, runtime) {
   const cacheKey = buildCacheStorageKey(CACHE_NAMESPACE_TMDB, {
     path,
-    params: Object.fromEntries(
+    params: createObjectFromEntries(
       Object.entries(options?.params ?? {}).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey)),
     ),
   });
@@ -2233,18 +2289,18 @@ function sortCatalogRecords(records, sortKey) {
 const DETAIL_LINK_SCHEME = 'fw-tmdb:';
 
 function buildDetailLink({ mediaType, tmdbId, seasonNumber, episodeNumber, translationConfig }) {
-  const queryParams = new URLSearchParams();
+  const queryParams = {};
 
   if (isMeaningfulText(translationConfig?.baseUrl)) {
-    queryParams.set(GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL, translationConfig.baseUrl);
+    queryParams[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL] = translationConfig.baseUrl;
   }
 
   if (isMeaningfulText(translationConfig?.token)) {
-    queryParams.set(GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN, translationConfig.token);
+    queryParams[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN] = translationConfig.token;
   }
 
   if (isMeaningfulText(translationConfig?.model)) {
-    queryParams.set(GLOBAL_PARAM_KEYS.TRANSLATION_MODEL, translationConfig.model);
+    queryParams[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL] = translationConfig.model;
   }
 
   let link = `${DETAIL_LINK_SCHEME}//${mediaType}/${tmdbId}`;
@@ -2257,19 +2313,23 @@ function buildDetailLink({ mediaType, tmdbId, seasonNumber, episodeNumber, trans
     link += `/episode/${episodeNumber}`;
   }
 
-  const queryString = queryParams.toString();
+  const queryString = buildQueryString(queryParams);
   return queryString ? `${link}?${queryString}` : link;
 }
 
 function parseDetailLink(link) {
-  const parsedUrl = new URL(link);
-  if (parsedUrl.protocol !== `${DETAIL_LINK_SCHEME}`) {
+  const normalizedLink = normalizeTitle(link);
+  const schemePrefix = `${DETAIL_LINK_SCHEME}//`;
+
+  if (!normalizedLink.startsWith(schemePrefix)) {
     throw new Error(`不支持的详情链接：${link}`);
   }
 
-  const mediaType = parsedUrl.hostname;
-  const segments = parsedUrl.pathname.split('/').filter(Boolean);
-  const tmdbId = Number.parseInt(segments[0] ?? '', 10);
+  const [pathPart, rawQuery = ''] = normalizedLink.split('?');
+  const pathWithoutScheme = pathPart.slice(schemePrefix.length);
+  const segments = pathWithoutScheme.split('/').filter(Boolean);
+  const mediaType = segments[0] ?? '';
+  const tmdbId = Number.parseInt(segments[1] ?? '', 10);
 
   if (!Number.isFinite(tmdbId) || ![MEDIA_TYPES.MOVIE, MEDIA_TYPES.TV].includes(mediaType)) {
     throw new Error(`无效的详情链接：${link}`);
@@ -2286,7 +2346,7 @@ function parseDetailLink(link) {
     tmdbId,
     seasonNumber: Number.isFinite(seasonNumber) ? seasonNumber : null,
     episodeNumber: Number.isFinite(episodeNumber) ? episodeNumber : null,
-    rawParams: Object.fromEntries(parsedUrl.searchParams.entries()),
+    rawParams: parseQueryString(rawQuery),
   };
 }
 
@@ -2845,7 +2905,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持分类墙提速、自定义详情与中文标题回退。',
-  version: "0.4.1",
+  version: "0.4.2",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
