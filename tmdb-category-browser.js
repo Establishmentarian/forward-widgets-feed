@@ -90,16 +90,16 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_MODEL,
     title: '翻译模型名',
     type: 'input',
-    value: 'Qwen/Qwen3.5-4B',
+    value: 'Qwen/Qwen2.5-7B-Instruct',
     description: '默认使用 Worker 的速度优先模型；也可自行改成其他兼容模型。',
     placeholders: [
       {
-        title: 'Qwen/Qwen3.5-4B',
-        value: 'Qwen/Qwen3.5-4B',
-      },
-      {
         title: 'Qwen/Qwen2.5-7B-Instruct',
         value: 'Qwen/Qwen2.5-7B-Instruct',
+      },
+      {
+        title: 'Qwen/Qwen3.5-4B',
+        value: 'Qwen/Qwen3.5-4B',
       },
       {
         title: 'gpt-5.4-nano',
@@ -742,7 +742,7 @@ function modelSupportsThinkingToggle(model) {
     return false;
   }
 
-  return normalized.includes('qwen3') || normalized.includes('deepseek-r1') || normalized.includes('qwq');
+  return normalized.includes('deepseek-r1') || normalized.includes('qwq');
 }
 
 function parseJsonSafely(value) {
@@ -771,6 +771,34 @@ function getContentJsonCandidate(content) {
   return '';
 }
 
+function normalizeParsedTranslationValue(value) {
+  if (typeof value === 'string') {
+    return normalizeTitle(value);
+  }
+
+  if (!value || typeof value !== 'object') {
+    return '';
+  }
+
+  const candidates = [
+    value.translation,
+    value.translatedTitle,
+    value.title,
+    value.name,
+    value.text,
+    value.result,
+  ];
+
+  for (const candidate of candidates) {
+    const normalizedCandidate = normalizeTitle(candidate);
+    if (normalizedCandidate) {
+      return normalizedCandidate;
+    }
+  }
+
+  return '';
+}
+
 function parseTranslationResponseContent(content, expectedCount) {
   if (!isMeaningfulText(content)) {
     return [];
@@ -778,22 +806,28 @@ function parseTranslationResponseContent(content, expectedCount) {
 
   const directParsed = parseJsonSafely(content);
   if (Array.isArray(directParsed)) {
-    return directParsed.map((value) => normalizeTitle(String(value))).slice(0, expectedCount);
+    return directParsed.map((value) => normalizeParsedTranslationValue(value)).filter(Boolean).slice(0, expectedCount);
   }
 
   if (Array.isArray(directParsed?.translations)) {
-    return directParsed.translations.map((value) => normalizeTitle(String(value))).slice(0, expectedCount);
+    return directParsed.translations
+      .map((value) => normalizeParsedTranslationValue(value))
+      .filter(Boolean)
+      .slice(0, expectedCount);
   }
 
   const candidate = getContentJsonCandidate(content);
   const nestedParsed = candidate ? parseJsonSafely(candidate) : null;
 
   if (Array.isArray(nestedParsed)) {
-    return nestedParsed.map((value) => normalizeTitle(String(value))).slice(0, expectedCount);
+    return nestedParsed.map((value) => normalizeParsedTranslationValue(value)).filter(Boolean).slice(0, expectedCount);
   }
 
   if (Array.isArray(nestedParsed?.translations)) {
-    return nestedParsed.translations.map((value) => normalizeTitle(String(value))).slice(0, expectedCount);
+    return nestedParsed.translations
+      .map((value) => normalizeParsedTranslationValue(value))
+      .filter(Boolean)
+      .slice(0, expectedCount);
   }
 
   return content
@@ -2974,7 +3008,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.0",
+  version: "0.5.1",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
