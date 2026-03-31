@@ -32,7 +32,7 @@ const TRANSLATION_LARGE_BATCH_SIZE = 20;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
 const TRANSLATION_INTER_BATCH_DELAY_MS = 350;
 const TRANSLATION_MAX_ATTEMPTS = 2;
-const TRANSLATION_PROMPT_VERSION = 'v7';
+const TRANSLATION_PROMPT_VERSION = 'v8';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
@@ -66,16 +66,16 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL,
     title: '翻译接口 Base URL',
     type: 'input',
-    value: 'https://api.astrocean.space/v1',
-    description: '默认预填 Astrocean OpenAI 兼容接口，可自行改成其他兼容服务。',
+    value: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
+    description: '默认预填带缓存的翻译 Worker；改成其他 OpenAI 兼容服务时会回退为高级直连模式。',
     placeholders: [
-      {
-        title: 'https://api.astrocean.space/v1',
-        value: 'https://api.astrocean.space/v1',
-      },
       {
         title: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
         value: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
+      },
+      {
+        title: 'https://api.astrocean.space/v1',
+        value: 'https://api.astrocean.space/v1',
       },
     ],
   },
@@ -83,27 +83,27 @@ const GLOBAL_PARAM_OPTIONS = Object.freeze([
     name: GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN,
     title: '翻译接口 Token',
     type: 'input',
-    value: 'sk-aef500db7c237d99f5b00830d9a6d82cd1d74e5a83679d412e488ed7adbc314c',
-    description: '默认预填 Astrocean Token；改用代理 Worker 时可留空。',
+    value: '',
+    description: '默认 Worker 模式无需填写；改成外部 OpenAI 兼容服务时再填对应 Token。',
   },
   {
     name: GLOBAL_PARAM_KEYS.TRANSLATION_MODEL,
     title: '翻译模型名',
     type: 'input',
-    value: 'gpt-5.4-nano',
-    description: '默认使用速度优先的 gpt-5.4-nano，可自行改成其他兼容模型。',
+    value: 'Qwen/Qwen3.5-4B',
+    description: '默认使用 Worker 的速度优先模型；也可自行改成其他兼容模型。',
     placeholders: [
       {
-        title: 'gpt-5.4-nano',
-        value: 'gpt-5.4-nano',
-      },
-      {
-        title: 'gpt-5.4-mini',
-        value: 'gpt-5.4-mini',
+        title: 'Qwen/Qwen3.5-4B',
+        value: 'Qwen/Qwen3.5-4B',
       },
       {
         title: 'Qwen/Qwen2.5-7B-Instruct',
         value: 'Qwen/Qwen2.5-7B-Instruct',
+      },
+      {
+        title: 'gpt-5.4-nano',
+        value: 'gpt-5.4-nano',
       },
     ],
   },
@@ -1066,10 +1066,14 @@ function buildTranslationJob(record) {
 
   return {
     fieldKind: 'title',
+    tmdbId: record.tmdbId,
+    mediaType: record.mediaType,
     title,
     originalTitle,
     jobKey: stableStringify({
       fieldKind: 'title',
+      tmdbId: record.tmdbId,
+      mediaType: record.mediaType,
       title,
       originalTitle,
     }),
@@ -1539,6 +1543,8 @@ async function cachedTmdbGet(path, options, runtime) {
 
 function buildTranslationItemsPayload(items) {
   return items.map((item) => ({
+    tmdbId: item.tmdbId,
+    mediaType: item.mediaType,
     title: item.title,
     originalTitle: item.originalTitle,
   }));
@@ -1559,8 +1565,10 @@ function buildTranslationCacheKey(job, primaryConfig, fallbackConfig) {
     fallbackBaseUrl: fallbackConfig?.baseUrl ?? '',
     fallbackModel: fallbackConfig?.model ?? '',
     promptVersion: TRANSLATION_PROMPT_VERSION,
-    title: job.title ?? '',
-    originalTitle: job.originalTitle ?? '',
+    tmdbId: job.tmdbId ?? '',
+    mediaType: job.mediaType ?? '',
+    title: job.tmdbId ? '' : job.title ?? '',
+    originalTitle: job.tmdbId ? '' : job.originalTitle ?? '',
     text: job.text ?? '',
     contextTitle: job.contextTitle ?? '',
   });
@@ -1586,6 +1594,7 @@ async function requestTranslationBatch(items, translationConfig, runtime, { stri
         items: buildTranslationItemsPayload(items),
         model: translationConfig.model,
         strict,
+        promptVersion: TRANSLATION_PROMPT_VERSION,
       },
       {
         headers: {
@@ -1893,6 +1902,26 @@ async function translateTitlesWithCache(jobs, translationConfig, runtime) {
     missingJobs.push(job);
   }
 
+  if (isTranslationProxyMode(translationConfig) && missingJobs.length) {
+    const { translatedBatch } = await requestTranslationBatchWithBackoff(missingJobs, translationConfig, runtime);
+    const unresolvedEntries = collectUntranslatedEntries(missingJobs, translatedBatch);
+    const unresolvedJobKeys = new Set(unresolvedEntries.map((entry) => entry.job.jobKey));
+
+    for (const [batchIndex, job] of missingJobs.entries()) {
+      const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || job.title;
+      const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
+
+      if (!unresolvedJobKeys.has(job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
+        translatedMap.set(job.jobKey, translatedTitle);
+        await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
+      } else {
+        await persistFailedTranslation(runtime, cacheKey);
+      }
+    }
+
+    return translatedMap;
+  }
+
   for (let largeIndex = 0; largeIndex < missingJobs.length; largeIndex += TRANSLATION_LARGE_BATCH_SIZE) {
     const largeBatch = missingJobs.slice(largeIndex, largeIndex + TRANSLATION_LARGE_BATCH_SIZE);
     const { translatedBatch } = hasTranslationConfig(translationConfig)
@@ -2129,6 +2158,27 @@ function createRuntime(rawParams, overrides = {}) {
 async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
   const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
+  const shouldFetchTraditional = !isChineseCategory(categoryId);
+
+  if (shouldFetchTraditional) {
+    const [simplifiedResponse, traditionalResponse] = await Promise.all([
+      cachedTmdbGet(endpoint, {
+        params: {
+          ...commonParams,
+          language: TMDB_LANGUAGE_SIMPLIFIED,
+        },
+      }, runtime),
+      cachedTmdbGet(endpoint, {
+        params: {
+          ...commonParams,
+          language: TMDB_LANGUAGE_TRADITIONAL,
+        },
+      }, runtime),
+    ]);
+
+    return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, traditionalResponse ?? {});
+  }
+
   const simplifiedResponse = await cachedTmdbGet(endpoint, {
     params: {
       ...commonParams,
@@ -2136,17 +2186,7 @@ async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, source
     },
   }, runtime);
 
-  let traditionalResponse = null;
-  if (!isChineseCategory(categoryId) && shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
-    traditionalResponse = await cachedTmdbGet(endpoint, {
-      params: {
-        ...commonParams,
-        language: TMDB_LANGUAGE_TRADITIONAL,
-      },
-    }, runtime);
-  }
-
-  return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, traditionalResponse ?? {});
+  return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, {});
 }
 
 const EXPLICIT_ADULT_PATTERNS = [
@@ -2313,6 +2353,14 @@ function sortCatalogRecords(records, sortKey) {
 
 const DETAIL_LINK_SCHEME = 'fw-tmdb:';
 
+function buildTmdbItemId(mediaType, tmdbId) {
+  return `${mediaType}.${tmdbId}`;
+}
+
+function buildTmdbWebLink(mediaType, tmdbId) {
+  return `${TMDB_WEB_BASE}/${mediaType}/${tmdbId}`;
+}
+
 function buildDetailLink({ mediaType, tmdbId, seasonNumber, episodeNumber, translationConfig }) {
   const queryParams = {};
 
@@ -2424,18 +2472,14 @@ function buildChildDetailItem(record, link, description, { mediaType = record.me
   };
 }
 
-function mapRecordToVideoItem(record, categoryTitle, translationConfig) {
+function mapRecordToVideoItem(record, categoryTitle) {
   const detailText = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
 
   return {
-    id: String(record.tmdbId),
+    id: buildTmdbItemId(record.mediaType, record.tmdbId),
     tmdbId: record.tmdbId,
-    type: 'detail',
-    link: buildDetailLink({
-      mediaType: record.mediaType,
-      tmdbId: record.tmdbId,
-      translationConfig,
-    }),
+    type: 'tmdb',
+    link: buildTmdbWebLink(record.mediaType, record.tmdbId),
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
     posterPath: record.posterPath,
     backdropPath: record.backdropPath,
@@ -2904,7 +2948,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
   }
 
-  return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle, runtime.translationConfig));
+  return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
 }
 
 async function loadCatalogDetail(link, overrides = {}) {
@@ -2929,8 +2973,8 @@ async function loadCatalogDetail(link, overrides = {}) {
 var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
-  description: '基于 TMDb 的剧集与电影分类浏览模块，支持分类墙提速、自定义详情与中文标题回退。',
-  version: "0.4.3",
+  description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
+  version: "0.5.0",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -2939,7 +2983,7 @@ var WidgetMetadata = {
       id: 'tmdb-category-browser',
       type: 'video',
       title: '影视分类',
-      description: '按统一分类和排序浏览 TMDb 影视条目，支持电影与剧集合并大类，以及自定义中文详情页。',
+      description: '按统一分类和排序浏览 TMDb 影视条目，保持原生 TMDb 播放链路，并尽量优先展示中文标题。',
       functionName: 'browseTmdbCategories',
       cacheDuration: 3600,
       params: [
@@ -2992,11 +3036,7 @@ var WidgetMetadata = {
   ],
 };
 
-// 列表页只负责组织分类墙，详情页则交给下面的自定义 loadDetail 链路继续中文化。
+// 视频卡片统一走 Forward 原生 TMDb 链路，避免自定义 detail 入口干扰视频源识别。
 async function browseTmdbCategories(params) {
   return browseCatalog(params);
-}
-
-async function loadDetail(link) {
-  return loadCatalogDetail(link);
 }
