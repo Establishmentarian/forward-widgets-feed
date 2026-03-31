@@ -442,9 +442,34 @@ function getDefaultTmdbGet() {
   return Widget.tmdb.get.bind(Widget.tmdb);
 }
 
+function getRuntimeGlobal() {
+  // 某些 Forward 宿主环境没有 globalThis，直接引用会在模块初始化阶段抛 ReferenceError。
+  // 这里逐个探测常见全局对象，确保缺计时器时最多降级，不会把整个模块炸掉。
+  if (typeof globalThis !== 'undefined') {
+    return globalThis;
+  }
+
+  if (typeof self !== 'undefined') {
+    return self;
+  }
+
+  if (typeof window !== 'undefined') {
+    return window;
+  }
+
+  if (typeof global !== 'undefined') {
+    return global;
+  }
+
+  return {};
+}
+
 function getTimerFunctions() {
-  const safeSetTimeout = typeof globalThis?.setTimeout === 'function' ? globalThis.setTimeout.bind(globalThis) : null;
-  const safeClearTimeout = typeof globalThis?.clearTimeout === 'function' ? globalThis.clearTimeout.bind(globalThis) : null;
+  const runtimeGlobal = getRuntimeGlobal();
+  const safeSetTimeout =
+    typeof runtimeGlobal.setTimeout === 'function' ? runtimeGlobal.setTimeout.bind(runtimeGlobal) : null;
+  const safeClearTimeout =
+    typeof runtimeGlobal.clearTimeout === 'function' ? runtimeGlobal.clearTimeout.bind(runtimeGlobal) : null;
 
   return {
     setTimeout: safeSetTimeout,
@@ -2905,7 +2930,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持分类墙提速、自定义详情与中文标题回退。',
-  version: "0.4.2",
+  version: "0.4.3",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
