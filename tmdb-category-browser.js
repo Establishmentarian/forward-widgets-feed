@@ -9,12 +9,8 @@ const MEDIA_TYPES = Object.freeze({
 const SORT_KEYS = Object.freeze({
   DATE_DESC: 'date_desc',
   DATE_ASC: 'date_asc',
-  YEAR_DESC: 'year_desc',
-  YEAR_ASC: 'year_asc',
   RATING_DESC: 'rating_desc',
   RATING_ASC: 'rating_asc',
-  TITLE_ASC: 'title_asc',
-  TITLE_DESC: 'title_desc',
 });
 
 const DEFAULT_COUNT = 20;
@@ -31,7 +27,7 @@ const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
 const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
 const TRANSLATION_BATCH_SIZE = 20;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
-const TRANSLATION_PROMPT_VERSION = 'v3';
+const TRANSLATION_PROMPT_VERSION = 'v4';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 5,
   rating: 20,
@@ -354,28 +350,12 @@ const SORT_OPTIONS = Object.freeze([
     value: SORT_KEYS.DATE_ASC,
   },
   {
-    title: '年份：新到旧',
-    value: SORT_KEYS.YEAR_DESC,
-  },
-  {
-    title: '年份：旧到新',
-    value: SORT_KEYS.YEAR_ASC,
-  },
-  {
     title: 'TMDb 评分：高到低',
     value: SORT_KEYS.RATING_DESC,
   },
   {
     title: 'TMDb 评分：低到高',
     value: SORT_KEYS.RATING_ASC,
-  },
-  {
-    title: '标题：正序',
-    value: SORT_KEYS.TITLE_ASC,
-  },
-  {
-    title: '标题：倒序',
-    value: SORT_KEYS.TITLE_DESC,
   },
 ]);
 
@@ -715,25 +695,34 @@ function isTranslationProxyMode(config) {
   return Boolean(config?.baseUrl && config?.model && !config?.token);
 }
 
+function isUsableTmdbChineseTitle(title) {
+  const normalizedTitle = normalizeTitle(title);
+  return Boolean(normalizedTitle && containsHan(normalizedTitle) && !containsNonChineseScript(normalizedTitle));
+}
+
+function getMachineTranslationSourceTitle(record) {
+  return normalizeTitle(record.displayTitle)
+    || normalizeTitle(record.simplifiedTitle)
+    || normalizeTitle(record.traditionalTitle)
+    || normalizeTitle(record.originalTitle);
+}
+
 function shouldAttemptMachineTranslation(record) {
-  const originalTitle = normalizeTitle(record.originalTitle);
-
-  if (!originalTitle) {
+  if (isUsableTmdbChineseTitle(record.simplifiedTitle) || isUsableTmdbChineseTitle(record.traditionalTitle)) {
     return false;
   }
 
-  if (normalizeTitle(record.displayTitle) !== originalTitle) {
+  const translationSourceTitle = getMachineTranslationSourceTitle(record);
+
+  if (!translationSourceTitle) {
     return false;
   }
 
-  const hasSimplifiedTranslation = isMeaningfulText(record.simplifiedTitle) && normalizeTitle(record.simplifiedTitle) !== originalTitle;
-  const hasTraditionalTranslation = isMeaningfulText(record.traditionalTitle) && normalizeTitle(record.traditionalTitle) !== originalTitle;
-
-  if (hasSimplifiedTranslation || hasTraditionalTranslation) {
+  if (isUsableTmdbChineseTitle(translationSourceTitle)) {
     return false;
   }
 
-  return !containsHan(originalTitle) || containsNonChineseScript(originalTitle);
+  return !containsHan(translationSourceTitle) || containsNonChineseScript(translationSourceTitle);
 }
 
 function chooseLocalizedField(primaryItem, secondaryItem, selector) {
@@ -903,19 +892,12 @@ function getTmdbSortBy(mediaType, sortKey) {
         return 'primary_release_date.asc';
       case SORT_KEYS.DATE_DESC:
         return 'primary_release_date.desc';
-      case SORT_KEYS.YEAR_ASC:
-        return 'primary_release_date.asc';
-      case SORT_KEYS.YEAR_DESC:
-        return 'primary_release_date.desc';
       case SORT_KEYS.RATING_ASC:
         return 'vote_average.asc';
       case SORT_KEYS.RATING_DESC:
         return 'vote_average.desc';
-      case SORT_KEYS.TITLE_DESC:
-        return 'title.desc';
-      case SORT_KEYS.TITLE_ASC:
       default:
-        return 'title.asc';
+        return 'primary_release_date.desc';
     }
   }
 
@@ -924,19 +906,12 @@ function getTmdbSortBy(mediaType, sortKey) {
       return 'first_air_date.asc';
     case SORT_KEYS.DATE_DESC:
       return 'first_air_date.desc';
-    case SORT_KEYS.YEAR_ASC:
-      return 'first_air_date.asc';
-    case SORT_KEYS.YEAR_DESC:
-      return 'first_air_date.desc';
     case SORT_KEYS.RATING_ASC:
       return 'vote_average.asc';
     case SORT_KEYS.RATING_DESC:
       return 'vote_average.desc';
-    case SORT_KEYS.TITLE_DESC:
-      return 'name.desc';
-    case SORT_KEYS.TITLE_ASC:
     default:
-      return 'name.asc';
+      return 'first_air_date.desc';
   }
 }
 
@@ -1269,18 +1244,28 @@ async function translateTitlesWithCache(titles, translationConfig, runtime) {
     missingTitles.push(title);
   }
 
+  const batchRequests = [];
   for (let index = 0; index < missingTitles.length; index += TRANSLATION_BATCH_SIZE) {
     const batch = missingTitles.slice(index, index + TRANSLATION_BATCH_SIZE);
-    let translatedBatch = batch;
-    let requestSucceeded = false;
+    batchRequests.push(
+      (async () => {
+        let translatedBatch = batch;
+        let requestSucceeded = false;
 
-    try {
-      translatedBatch = await requestTranslationBatch(batch, translationConfig, runtime);
-      requestSucceeded = true;
-    } catch {
-      translatedBatch = batch;
-    }
+        try {
+          translatedBatch = await requestTranslationBatch(batch, translationConfig, runtime);
+          requestSucceeded = true;
+        } catch {
+          translatedBatch = batch;
+        }
 
+        return { batch, translatedBatch, requestSucceeded };
+      })(),
+    );
+  }
+
+  const batchResults = await Promise.all(batchRequests);
+  for (const { batch, translatedBatch, requestSucceeded } of batchResults) {
     for (const [batchIndex, title] of batch.entries()) {
       const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || title;
       translatedMap.set(title, translatedTitle);
@@ -1312,14 +1297,21 @@ async function applyMachineTranslationFallback(records, translationConfig, runti
     return records;
   }
 
+  const translationSourceByRecordKey = new Map(
+    translationTargets.map((record) => [`${record.mediaType}:${record.tmdbId}`, getMachineTranslationSourceTitle(record)]),
+  );
+
   const translatedMap = await translateTitlesWithCache(
-    translationTargets.map((record) => record.originalTitle),
+    translationTargets
+      .map((record) => translationSourceByRecordKey.get(`${record.mediaType}:${record.tmdbId}`))
+      .filter(Boolean),
     translationConfig,
     runtime,
   );
 
   for (const record of translationTargets) {
-    const translatedTitle = translatedMap.get(record.originalTitle);
+    const translationSourceTitle = translationSourceByRecordKey.get(`${record.mediaType}:${record.tmdbId}`);
+    const translatedTitle = translatedMap.get(translationSourceTitle);
 
     if (isMeaningfulText(translatedTitle)) {
       record.displayTitle = translatedTitle;
@@ -1496,15 +1488,6 @@ function compareOptionalNumber(left, right) {
   return safeLeft - safeRight;
 }
 
-function extractYear(dateText) {
-  if (!isMeaningfulText(dateText)) {
-    return -Infinity;
-  }
-
-  const year = Number.parseInt(dateText.slice(0, 4), 10);
-  return Number.isFinite(year) ? year : -Infinity;
-}
-
 function sortCatalogRecords(records, sortKey) {
   const sorted = [...records];
 
@@ -1518,20 +1501,6 @@ function sortCatalogRecords(records, sortKey) {
         );
       case SORT_KEYS.DATE_DESC:
         return (
-          compareOptionalDate(right.releaseDate, left.releaseDate) ||
-          compareText(left.displayTitle, right.displayTitle) ||
-          left.tmdbId - right.tmdbId
-        );
-      case SORT_KEYS.YEAR_ASC:
-        return (
-          extractYear(left.releaseDate) - extractYear(right.releaseDate) ||
-          compareOptionalDate(left.releaseDate, right.releaseDate) ||
-          compareText(left.displayTitle, right.displayTitle) ||
-          left.tmdbId - right.tmdbId
-        );
-      case SORT_KEYS.YEAR_DESC:
-        return (
-          extractYear(right.releaseDate) - extractYear(left.releaseDate) ||
           compareOptionalDate(right.releaseDate, left.releaseDate) ||
           compareText(left.displayTitle, right.displayTitle) ||
           left.tmdbId - right.tmdbId
@@ -1550,17 +1519,10 @@ function sortCatalogRecords(records, sortKey) {
           compareText(left.displayTitle, right.displayTitle) ||
           left.tmdbId - right.tmdbId
         );
-      case SORT_KEYS.TITLE_DESC:
-        return (
-          compareText(right.displayTitle, left.displayTitle) ||
-          compareOptionalDate(right.releaseDate, left.releaseDate) ||
-          left.tmdbId - right.tmdbId
-        );
-      case SORT_KEYS.TITLE_ASC:
       default:
         return (
-          compareText(left.displayTitle, right.displayTitle) ||
           compareOptionalDate(right.releaseDate, left.releaseDate) ||
+          compareText(left.displayTitle, right.displayTitle) ||
           left.tmdbId - right.tmdbId
         );
     }
@@ -1699,19 +1661,13 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     }
   }
 
-  if (params.sortKey === SORT_KEYS.TITLE_ASC || params.sortKey === SORT_KEYS.TITLE_DESC) {
-    await applyMachineTranslationFallback(collected, runtime.translationConfig, runtime);
-  }
-
   const sorted = sortCatalogRecords(collected, params.sortKey);
   const startIndex = (params.page - 1) * params.count;
   const endIndex = startIndex + params.count;
   const categoryTitle = selectedScopes[0].rule.title;
   const pagedRecords = sorted.slice(startIndex, endIndex);
 
-  if (params.sortKey !== SORT_KEYS.TITLE_ASC && params.sortKey !== SORT_KEYS.TITLE_DESC) {
-    await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
-  }
+  await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
 
   return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
 }
@@ -1720,7 +1676,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，支持中文标题回退与多种排序方式。',
-  version: "0.3.3",
+  version: "0.3.4",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
