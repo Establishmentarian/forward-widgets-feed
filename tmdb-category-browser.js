@@ -434,6 +434,77 @@ function getDefaultSort() {
   return SORT_KEYS.DATE_DESC;
 }
 
+var WidgetMetadata = {
+  id: 'tmdb-category-browser',
+  title: 'TMDb 剧集/电影分类',
+  description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
+  version: "0.5.3",
+  requiredVersion: '0.0.1',
+  author: 'Codex',
+  globalParams: GLOBAL_PARAM_OPTIONS,
+  modules: [
+    {
+      id: 'tmdb-category-browser',
+      type: 'video',
+      title: '影视分类',
+      description: '按统一分类和排序浏览 TMDb 影视条目，保持原生 TMDb 播放链路，并尽量优先展示中文标题。',
+      functionName: 'browseTmdbCategories',
+      cacheDuration: 3600,
+      params: [
+        {
+          name: 'sort_by',
+          title: '排序方式',
+          type: 'enumeration',
+          value: 'date_desc',
+          enumOptions: SORT_OPTIONS,
+        },
+        {
+          name: 'category',
+          title: '分类',
+          type: 'enumeration',
+          value: 'chinese_movie',
+          enumOptions: CATEGORY_OPTIONS,
+        },
+        {
+          name: 'count',
+          title: '每页数量',
+          type: 'count',
+          value: '20',
+          placeholders: [
+            {
+              title: '10 条',
+              value: '10',
+            },
+            {
+              title: '20 条',
+              value: '20',
+            },
+            {
+              title: '40 条',
+              value: '40',
+            },
+            {
+              title: '60 条',
+              value: '60',
+            },
+          ],
+        },
+        {
+          name: 'page',
+          title: '页码',
+          type: 'page',
+          value: '1',
+        },
+      ],
+    },
+  ],
+};
+
+// 视频卡片统一走 Forward 原生 TMDb 链路，避免自定义 detail 入口干扰视频源识别。
+async function browseTmdbCategories(params) {
+  return browseCatalog(params);
+}
+
 function getDefaultTmdbGet() {
   if (typeof Widget === 'undefined' || !Widget?.tmdb?.get) {
     throw new Error('当前运行环境缺少 Widget.tmdb.get，无法请求 TMDb。');
@@ -3002,75 +3073,4 @@ async function loadCatalogDetail(link, overrides = {}) {
   }
 
   return loadSeriesDetailFromLink(parsedLink, runtime);
-}
-
-var WidgetMetadata = {
-  id: 'tmdb-category-browser',
-  title: 'TMDb 剧集/电影分类',
-  description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.2",
-  requiredVersion: '0.0.1',
-  author: 'Codex',
-  globalParams: GLOBAL_PARAM_OPTIONS,
-  modules: [
-    {
-      id: 'tmdb-category-browser',
-      type: 'video',
-      title: '影视分类',
-      description: '按统一分类和排序浏览 TMDb 影视条目，保持原生 TMDb 播放链路，并尽量优先展示中文标题。',
-      functionName: 'browseTmdbCategories',
-      cacheDuration: 3600,
-      params: [
-        {
-          name: 'sort_by',
-          title: '排序方式',
-          type: 'enumeration',
-          value: 'date_desc',
-          enumOptions: SORT_OPTIONS,
-        },
-        {
-          name: 'category',
-          title: '分类',
-          type: 'enumeration',
-          value: 'chinese_movie',
-          enumOptions: CATEGORY_OPTIONS,
-        },
-        {
-          name: 'count',
-          title: '每页数量',
-          type: 'count',
-          value: '20',
-          placeholders: [
-            {
-              title: '10 条',
-              value: '10',
-            },
-            {
-              title: '20 条',
-              value: '20',
-            },
-            {
-              title: '40 条',
-              value: '40',
-            },
-            {
-              title: '60 条',
-              value: '60',
-            },
-          ],
-        },
-        {
-          name: 'page',
-          title: '页码',
-          type: 'page',
-          value: '1',
-        },
-      ],
-    },
-  ],
-};
-
-// 视频卡片统一走 Forward 原生 TMDb 链路，避免自定义 detail 入口干扰视频源识别。
-async function browseTmdbCategories(params) {
-  return browseCatalog(params);
 }
