@@ -438,7 +438,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.3",
+  version: "0.5.4",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -1443,6 +1443,8 @@ function createRequestMemo() {
   return {
     cachedJsonValues: new Map(),
     tmdbResponses: new Map(),
+    queuedCacheEntries: new Map(),
+    accessedCacheKeys: new Map(),
   };
 }
 
@@ -1488,6 +1490,23 @@ async function saveCacheManifest(cacheState, manifest) {
   await cacheState.storage.set(CACHE_MANIFEST_KEY, JSON.stringify(manifest));
 }
 
+function queueRuntimeCacheWrite(runtime, entry) {
+  if (!runtime?.requestMemo?.queuedCacheEntries || !isMeaningfulText(entry?.cacheKey)) {
+    return;
+  }
+
+  runtime.requestMemo.cachedJsonValues.set(entry.cacheKey, entry.value);
+  runtime.requestMemo.queuedCacheEntries.set(entry.cacheKey, entry);
+}
+
+function markRuntimeCacheAccess(runtime, cacheKey) {
+  if (!runtime?.requestMemo?.accessedCacheKeys || !isMeaningfulText(cacheKey)) {
+    return;
+  }
+
+  runtime.requestMemo.accessedCacheKeys.set(cacheKey, Date.now());
+}
+
 function getManifestTotalBytes(manifest) {
   return Object.values(manifest.entries).reduce(
     (sum, entry) => sum + (Number.isFinite(entry?.size) ? entry.size : 0),
@@ -1527,39 +1546,50 @@ async function pruneCache(cacheState, manifest, maxBytes) {
   }
 }
 
-async function getCachedJsonValue(cacheState, cacheKey) {
+async function removeCachedJsonValue(cacheState, cacheKey) {
   return withCacheLock(cacheState, async () => {
     const manifest = await loadCacheManifest(cacheState);
-    const entry = manifest.entries[cacheKey];
 
-    if (!entry) {
-      return null;
+    if (!manifest.entries[cacheKey]) {
+      return;
     }
 
-    const now = Date.now();
-    if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) {
-      delete manifest.entries[cacheKey];
-      await cacheState.storage.remove(cacheKey).catch(() => {});
-      await saveCacheManifest(cacheState, manifest);
-      return null;
-    }
-
-    const rawValue = await cacheState.storage.get(cacheKey);
-    if (!isMeaningfulText(rawValue)) {
-      delete manifest.entries[cacheKey];
-      await saveCacheManifest(cacheState, manifest);
-      return null;
-    }
-
-    entry.lastAccess = now;
+    delete manifest.entries[cacheKey];
+    await cacheState.storage.remove(cacheKey).catch(() => {});
     await saveCacheManifest(cacheState, manifest);
-    return parseJsonSafely(rawValue);
   });
+}
+
+async function getCachedJsonValue(cacheState, cacheKey) {
+  const manifest = await loadCacheManifest(cacheState);
+  const entry = manifest.entries[cacheKey];
+
+  if (!entry) {
+    return null;
+  }
+
+  const now = Date.now();
+  if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) {
+    await removeCachedJsonValue(cacheState, cacheKey).catch(() => {});
+    return null;
+  }
+
+  const rawValue = await cacheState.storage.get(cacheKey);
+  if (!isMeaningfulText(rawValue)) {
+    await removeCachedJsonValue(cacheState, cacheKey).catch(() => {});
+    return null;
+  }
+
+  return parseJsonSafely(rawValue);
 }
 
 async function getCachedJsonValueFromRuntime(runtime, cacheKey) {
   if (runtime.requestMemo.cachedJsonValues.has(cacheKey)) {
-    return runtime.requestMemo.cachedJsonValues.get(cacheKey);
+    const cachedValue = runtime.requestMemo.cachedJsonValues.get(cacheKey);
+    if (cachedValue) {
+      markRuntimeCacheAccess(runtime, cacheKey);
+    }
+    return cachedValue;
   }
 
   const pendingValue = getCachedJsonValue(runtime.cacheState, cacheKey).catch((error) => {
@@ -1570,7 +1600,90 @@ async function getCachedJsonValueFromRuntime(runtime, cacheKey) {
   runtime.requestMemo.cachedJsonValues.set(cacheKey, pendingValue);
   const resolvedValue = await pendingValue;
   runtime.requestMemo.cachedJsonValues.set(cacheKey, resolvedValue);
+  if (resolvedValue) {
+    markRuntimeCacheAccess(runtime, cacheKey);
+  }
   return resolvedValue;
+}
+
+async function setMultipleCachedJsonValues(cacheState, entries, maxBytes, touchedEntries = new Map()) {
+  const queuedEntries = Array.from(
+    new Map(
+      (entries ?? [])
+        .filter((entry) => isMeaningfulText(entry?.cacheKey))
+        .map((entry) => [entry.cacheKey, entry]),
+    ).values(),
+  );
+
+  if (!queuedEntries.length && (!touchedEntries || !touchedEntries.size)) {
+    return;
+  }
+
+  return withCacheLock(cacheState, async () => {
+    const manifest = await loadCacheManifest(cacheState);
+    const now = Date.now();
+
+    for (const [cacheKey, lastAccess] of touchedEntries.entries()) {
+      const entry = manifest.entries[cacheKey];
+      if (entry && Number.isFinite(lastAccess)) {
+        entry.lastAccess = Math.max(entry.lastAccess ?? 0, lastAccess);
+      }
+    }
+
+    const stagedWrites = [];
+
+    for (const entry of queuedEntries) {
+      const rawValue = JSON.stringify(entry.value);
+      const size = estimateStringBytes(entry.cacheKey) + estimateStringBytes(rawValue);
+
+      if (size > maxBytes) {
+        continue;
+      }
+
+      manifest.entries[entry.cacheKey] = {
+        namespace: entry.namespace,
+        size,
+        lastAccess: now,
+        expiresAt: now + entry.ttlSeconds * 1000,
+      };
+
+      stagedWrites.push({
+        cacheKey: entry.cacheKey,
+        rawValue,
+      });
+    }
+
+    await pruneCache(cacheState, manifest, maxBytes);
+    const survivingKeys = new Set(Object.keys(manifest.entries));
+
+    await Promise.allSettled(
+      stagedWrites
+        .filter((entry) => survivingKeys.has(entry.cacheKey))
+        .map((entry) => cacheState.storage.set(entry.cacheKey, entry.rawValue)),
+    );
+
+    await saveCacheManifest(cacheState, manifest);
+  });
+}
+
+async function flushQueuedCacheWrites(runtime) {
+  const queuedEntries = Array.from(runtime.requestMemo.queuedCacheEntries.values());
+
+  if (!queuedEntries.length) {
+    runtime.requestMemo.accessedCacheKeys.clear();
+    return;
+  }
+
+  const touchedEntries = new Map(runtime.requestMemo.accessedCacheKeys);
+  runtime.requestMemo.queuedCacheEntries.clear();
+  runtime.requestMemo.accessedCacheKeys.clear();
+
+  await setMultipleCachedJsonValues(
+    runtime.cacheState,
+    queuedEntries,
+    runtime.cacheMaxBytes,
+    touchedEntries,
+  ).catch(() => {});
 }
 
 async function setCachedJsonValue(cacheState, cacheKey, value, { namespace, ttlSeconds, maxBytes }) {
@@ -1628,11 +1741,12 @@ async function cachedTmdbGet(path, options, runtime) {
 
     const response = await runtime.tmdbGet(path, options);
 
-    await setCachedJsonValueFromRuntime(runtime, cacheKey, response, {
+    queueRuntimeCacheWrite(runtime, {
+      cacheKey,
+      value: response,
       namespace: CACHE_NAMESPACE_TMDB,
       ttlSeconds: TMDB_CACHE_TTL_SECONDS,
-      maxBytes: runtime.cacheMaxBytes,
-    }).catch(() => {});
+    });
 
     return response;
   })().catch((error) => {
@@ -1911,27 +2025,30 @@ function collectUntranslatedOverviewEntries(batch, translatedBatch) {
 }
 
 async function persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle) {
-  await setCachedJsonValueFromRuntime(runtime, cacheKey, { translatedTitle, status: 'success' }, {
+  queueRuntimeCacheWrite(runtime, {
+    cacheKey,
+    value: { translatedTitle, status: 'success' },
     namespace: CACHE_NAMESPACE_TRANSLATE,
     ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
-    maxBytes: runtime.cacheMaxBytes,
-  }).catch(() => {});
+  });
 }
 
 async function persistSuccessfulOverviewTranslation(runtime, cacheKey, translatedText) {
-  await setCachedJsonValueFromRuntime(runtime, cacheKey, { translatedTitle: translatedText, status: 'success' }, {
+  queueRuntimeCacheWrite(runtime, {
+    cacheKey,
+    value: { translatedTitle: translatedText, status: 'success' },
     namespace: CACHE_NAMESPACE_TRANSLATE,
     ttlSeconds: TRANSLATION_OVERVIEW_CACHE_TTL_SECONDS,
-    maxBytes: runtime.cacheMaxBytes,
-  }).catch(() => {});
+  });
 }
 
 async function persistFailedTranslation(runtime, cacheKey) {
-  await setCachedJsonValueFromRuntime(runtime, cacheKey, { status: 'failed' }, {
+  queueRuntimeCacheWrite(runtime, {
+    cacheKey,
+    value: { status: 'failed' },
     namespace: CACHE_NAMESPACE_TRANSLATE,
     ttlSeconds: TRANSLATION_FAILURE_CACHE_TTL_SECONDS,
-    maxBytes: runtime.cacheMaxBytes,
-  }).catch(() => {});
+  });
 }
 
 async function translateSingleJobWithFallback(job, primaryConfig, runtime) {
@@ -2263,33 +2380,23 @@ function createRuntime(rawParams, overrides = {}) {
 async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
   const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
-  const shouldFetchTraditional = !isChineseCategory(categoryId);
-
-  if (shouldFetchTraditional) {
-    const [simplifiedResponse, traditionalResponse] = await Promise.all([
-      cachedTmdbGet(endpoint, {
-        params: {
-          ...commonParams,
-          language: TMDB_LANGUAGE_SIMPLIFIED,
-        },
-      }, runtime),
-      cachedTmdbGet(endpoint, {
-        params: {
-          ...commonParams,
-          language: TMDB_LANGUAGE_TRADITIONAL,
-        },
-      }, runtime),
-    ]);
-
-    return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, traditionalResponse ?? {});
-  }
-
   const simplifiedResponse = await cachedTmdbGet(endpoint, {
     params: {
       ...commonParams,
       language: TMDB_LANGUAGE_SIMPLIFIED,
     },
   }, runtime);
+
+  if (!isChineseCategory(categoryId) && shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
+    const traditionalResponse = await cachedTmdbGet(endpoint, {
+      params: {
+        ...commonParams,
+        language: TMDB_LANGUAGE_TRADITIONAL,
+      },
+    }, runtime);
+
+    return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, traditionalResponse ?? {});
+  }
 
   return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, {});
 }
@@ -2579,22 +2686,21 @@ function buildChildDetailItem(record, link, description, { mediaType = record.me
 
 function mapRecordToVideoItem(record, categoryTitle) {
   const detailText = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
+  const overview = normalizeTitle(record.overview) || '暂无简介';
 
   return {
-    id: buildTmdbItemId(record.mediaType, record.tmdbId),
+    id: String(record.tmdbId),
     tmdbId: record.tmdbId,
     type: 'tmdb',
-    link: buildTmdbWebLink(record.mediaType, record.tmdbId),
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
     posterPath: record.posterPath,
     backdropPath: record.backdropPath,
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
-    rating: formatRatingValue(record.voteAverage),
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
     description: detailText
-      ? `${detailText}\n${record.overview || '暂无简介'}`
-      : record.overview || '暂无简介',
+      ? `${detailText}\n${overview}`
+      : overview,
   };
 }
 
@@ -3053,6 +3159,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
   }
 
+  await flushQueuedCacheWrites(runtime);
   return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
 }
 
@@ -3060,17 +3167,17 @@ async function loadCatalogDetail(link, overrides = {}) {
   const parsedLink = parseDetailLink(link);
   const runtime = createRuntime(parsedLink.rawParams, overrides);
 
+  let detailResult;
   if (parsedLink.mediaType === MEDIA_TYPES.MOVIE) {
-    return loadMovieDetailFromLink(parsedLink, runtime);
+    detailResult = await loadMovieDetailFromLink(parsedLink, runtime);
+  } else if (Number.isFinite(parsedLink.episodeNumber)) {
+    detailResult = await loadEpisodeDetailFromLink(parsedLink, runtime);
+  } else if (Number.isFinite(parsedLink.seasonNumber)) {
+    detailResult = await loadSeasonDetailFromLink(parsedLink, runtime);
+  } else {
+    detailResult = await loadSeriesDetailFromLink(parsedLink, runtime);
   }
 
-  if (Number.isFinite(parsedLink.episodeNumber)) {
-    return loadEpisodeDetailFromLink(parsedLink, runtime);
-  }
-
-  if (Number.isFinite(parsedLink.seasonNumber)) {
-    return loadSeasonDetailFromLink(parsedLink, runtime);
-  }
-
-  return loadSeriesDetailFromLink(parsedLink, runtime);
+  await flushQueuedCacheWrites(runtime);
+  return detailResult;
 }
