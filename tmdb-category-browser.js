@@ -438,7 +438,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.7",
+  version: "0.5.8",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -2643,14 +2643,6 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
   return stringifyParams(params);
 }
 
-function shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse) {
-  return (simplifiedResponse?.results ?? []).some((item) => !isUsableTmdbChineseTitle(getRawTitle(item, mediaType)));
-}
-
-function hasLocalizedChineseCatalogTitle(record) {
-  return isUsableTmdbChineseTitle(record?.simplifiedTitle) || isUsableTmdbChineseTitle(record?.traditionalTitle);
-}
-
 function createRuntime(rawParams, overrides = {}) {
   const storage = overrides.storage ?? getDefaultStorage();
   const cacheMaxBytes = overrides.cacheOptions?.maxBytes ?? CACHE_MAX_BYTES;
@@ -2668,28 +2660,26 @@ function createRuntime(rawParams, overrides = {}) {
   };
 }
 
-async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
+async function fetchCatalogSimplifiedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
   const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
-  const simplifiedResponse = await cachedTmdbGet(endpoint, {
+  return cachedTmdbGet(endpoint, {
     params: {
       ...commonParams,
       language: TMDB_LANGUAGE_SIMPLIFIED,
     },
   }, runtime);
+}
 
-  if (shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
-    const traditionalResponse = await cachedTmdbGet(endpoint, {
-      params: {
-        ...commonParams,
-        language: TMDB_LANGUAGE_TRADITIONAL,
-      },
-    }, runtime);
-
-    return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, traditionalResponse ?? {});
-  }
-
-  return mergeLocalizedResults(mediaType, simplifiedResponse ?? {}, {});
+async function fetchCatalogTraditionalPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
+  const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
+  const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
+  return cachedTmdbGet(endpoint, {
+    params: {
+      ...commonParams,
+      language: TMDB_LANGUAGE_TRADITIONAL,
+    },
+  }, runtime);
 }
 
 const EXPLICIT_ADULT_PATTERNS = [
@@ -2785,6 +2775,70 @@ function buildSelectedScopes(categoryId, sourceMediaTypes, startPage) {
     .filter((scope) => scope.rule);
 }
 
+function resolveCatalogDisplayTitle(record) {
+  const simplifiedTitle = normalizeTitle(record?.simplifiedTitle);
+  if (isUsableTmdbChineseTitle(simplifiedTitle)) {
+    return simplifiedTitle;
+  }
+
+  const traditionalTitle = normalizeTitle(record?.traditionalTitle);
+  if (isUsableTmdbChineseTitle(traditionalTitle)) {
+    return traditionalTitle;
+  }
+
+  const originalTitle = normalizeTitle(record?.originalTitle);
+  if (originalTitle && containsHan(originalTitle)) {
+    return originalTitle;
+  }
+
+  return '';
+}
+
+function hasLocalizedChineseCatalogTitle(record) {
+  return Boolean(resolveCatalogDisplayTitle(record));
+}
+
+function collectCatalogCandidateRecords(records, mediaType, rule, categoryId, sortKey, todayDate) {
+  return records.filter((record) => {
+    if (!isAllowedRecord(record, todayDate, categoryId, sortKey)) {
+      return false;
+    }
+
+    const matchedRule = classifyMediaRecord(mediaType, record);
+    return Boolean(matchedRule && matchedRule.id === rule.id);
+  });
+}
+
+function shouldSupplementCatalogTraditionalPage(candidateRecords, collectedCount, neededCollectedCount) {
+  if (!candidateRecords.length) {
+    return false;
+  }
+
+  const readyCount = candidateRecords.filter((record) => hasLocalizedChineseCatalogTitle(record)).length;
+  const missingCount = candidateRecords.length - readyCount;
+
+  return missingCount > 0 && (collectedCount + readyCount) < neededCollectedCount;
+}
+
+function collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected) {
+  for (const record of candidateRecords) {
+    const displayTitle = resolveCatalogDisplayTitle(record);
+
+    if (!displayTitle) {
+      continue;
+    }
+
+    const recordKey = `${record.mediaType}:${record.tmdbId}`;
+    if (seenRecordKeys.has(recordKey)) {
+      continue;
+    }
+
+    record.displayTitle = displayTitle;
+    seenRecordKeys.add(recordKey);
+    collected.push(record);
+  }
+}
+
 async function collectCatalogRecords({
   params,
   runtime,
@@ -2800,9 +2854,9 @@ async function collectCatalogRecords({
   while (selectedScopes.some((scope) => !scope.exhausted) && fetchedRounds < maxRounds) {
     fetchedRounds += 1;
     const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
-    const pageResults = await Promise.all(
+    const simplifiedResponses = await Promise.all(
       activeScopes.map((scope) =>
-        fetchLocalizedPage({
+        fetchCatalogSimplifiedPage({
           mediaType: scope.mediaType,
           categoryId: params.categoryId,
           rule: scope.rule,
@@ -2815,36 +2869,46 @@ async function collectCatalogRecords({
     );
 
     for (const [index, scope] of activeScopes.entries()) {
-      const { results, totalPages } = pageResults[index];
-      scope.totalPages = totalPages;
+      const simplifiedResponse = simplifiedResponses[index] ?? {};
+      scope.totalPages = simplifiedResponse.total_pages ?? 0;
 
-      for (const record of results) {
-        if (!isAllowedRecord(record, todayDate, params.categoryId, params.sortKey)) {
-          continue;
-        }
+      let mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, {});
+      let candidateRecords = collectCatalogCandidateRecords(
+        mergedPage.results,
+        scope.mediaType,
+        scope.rule,
+        params.categoryId,
+        params.sortKey,
+        todayDate,
+      );
 
-        const matchedRule = classifyMediaRecord(scope.mediaType, record);
+      // 列表页只对“真正可能进入当前分类墙”的候选条目按需补抓繁体；
+      // 非候选的外文条目不会再触发整页 zh-TW 请求。
+      if (shouldSupplementCatalogTraditionalPage(candidateRecords, collected.length, neededCollectedCount)) {
+        const traditionalResponse = await fetchCatalogTraditionalPage({
+          mediaType: scope.mediaType,
+          categoryId: params.categoryId,
+          rule: scope.rule,
+          sortKey: params.sortKey,
+          sourcePage: scope.nextPage,
+          runtime,
+          todayDate,
+        });
 
-        if (!matchedRule || matchedRule.id !== scope.rule.id) {
-          continue;
-        }
-
-        // 分类墙先走“TMDb 自带中文优先”的极速路径。
-        // 没有简体或繁体中文标题的条目直接过滤，不再触发列表翻译。
-        if (!hasLocalizedChineseCatalogTitle(record)) {
-          continue;
-        }
-
-        const recordKey = `${record.mediaType}:${record.tmdbId}`;
-        if (seenRecordKeys.has(recordKey)) {
-          continue;
-        }
-
-        seenRecordKeys.add(recordKey);
-        collected.push(record);
+        mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, traditionalResponse ?? {});
+        candidateRecords = collectCatalogCandidateRecords(
+          mergedPage.results,
+          scope.mediaType,
+          scope.rule,
+          params.categoryId,
+          params.sortKey,
+          todayDate,
+        );
       }
 
-      const reachedRemoteEnd = !results.length || (totalPages > 0 && scope.nextPage >= totalPages);
+      collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected);
+
+      const reachedRemoteEnd = !(simplifiedResponse.results?.length) || (scope.totalPages > 0 && scope.nextPage >= scope.totalPages);
 
       if (reachedRemoteEnd) {
         scope.exhausted = true;
