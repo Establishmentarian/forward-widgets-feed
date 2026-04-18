@@ -32,7 +32,7 @@ const TRANSLATION_LARGE_BATCH_SIZE = 20;
 const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
 const TRANSLATION_INTER_BATCH_DELAY_MS = 350;
 const TRANSLATION_MAX_ATTEMPTS = 2;
-const TRANSLATION_PROMPT_VERSION = 'v8';
+const TRANSLATION_PROMPT_VERSION = 'v9';
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
@@ -43,8 +43,8 @@ const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const TMDB_LANGUAGE_SIMPLIFIED = 'zh-CN';
 const TMDB_LANGUAGE_TRADITIONAL = 'zh-TW';
 const DEFAULT_FALLBACK_TRANSLATION_CONFIG = Object.freeze({
-  baseUrl: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
-  token: '',
+  baseUrl: 'https://api.siliconflow.cn/v1',
+  token: 'sk-bnigjvsvbljezknsbskumtnpryzprtphnvirtcdvignussin',
   model: 'Qwen/Qwen2.5-7B-Instruct',
 });
 const STRICT_FOREIGN_CATEGORY_IDS = Object.freeze([
@@ -438,7 +438,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.4",
+  version: "0.5.6",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -732,6 +732,16 @@ function sleep(ms) {
   return new Promise((resolve) => timers.setTimeout(resolve, ms));
 }
 
+function chunkArray(array, size) {
+  const chunks = [];
+
+  for (let index = 0; index < array.length; index += size) {
+    chunks.push(array.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
 function buildTranslationSystemPrompt({ strict = false } = {}) {
   return strict
     ? '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题统一转换为自然、简体中文片名或剧名。若没有官方中译名，也必须给出常见中文译名或简洁音译，不要保留英文、法文、西语、德语、俄语、韩语罗马字或其他非中文原文。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。'
@@ -877,13 +887,12 @@ function parseTranslationResponseContent(content, expectedCount) {
 
   const directParsed = parseJsonSafely(content);
   if (Array.isArray(directParsed)) {
-    return directParsed.map((value) => normalizeParsedTranslationValue(value)).filter(Boolean).slice(0, expectedCount);
+    return directParsed.map((value) => normalizeParsedTranslationValue(value)).slice(0, expectedCount);
   }
 
   if (Array.isArray(directParsed?.translations)) {
     return directParsed.translations
       .map((value) => normalizeParsedTranslationValue(value))
-      .filter(Boolean)
       .slice(0, expectedCount);
   }
 
@@ -891,13 +900,12 @@ function parseTranslationResponseContent(content, expectedCount) {
   const nestedParsed = candidate ? parseJsonSafely(candidate) : null;
 
   if (Array.isArray(nestedParsed)) {
-    return nestedParsed.map((value) => normalizeParsedTranslationValue(value)).filter(Boolean).slice(0, expectedCount);
+    return nestedParsed.map((value) => normalizeParsedTranslationValue(value)).slice(0, expectedCount);
   }
 
   if (Array.isArray(nestedParsed?.translations)) {
     return nestedParsed.translations
       .map((value) => normalizeParsedTranslationValue(value))
-      .filter(Boolean)
       .slice(0, expectedCount);
   }
 
@@ -1136,6 +1144,14 @@ function buildFallbackTranslationConfig() {
 
 function hasTranslationConfig(config) {
   return Boolean(config?.baseUrl && config?.model);
+}
+
+function isSameTranslationConfig(left, right) {
+  return Boolean(
+    normalizeUrl(left?.baseUrl) === normalizeUrl(right?.baseUrl)
+      && normalizeTitle(left?.token) === normalizeTitle(right?.token)
+      && normalizeTitle(left?.model) === normalizeTitle(right?.model),
+  );
 }
 
 function isTranslationProxyMode(config) {
@@ -1446,6 +1462,249 @@ function createRequestMemo() {
     queuedCacheEntries: new Map(),
     accessedCacheKeys: new Map(),
   };
+}
+
+function createTranslationPhaseDiagnostic() {
+  return {
+    attempted: false,
+    succeeded: false,
+    reason: null,
+  };
+}
+
+function createTranslationJobDiagnostic() {
+  return {
+    translated: false,
+    finalFailure: false,
+    primary: createTranslationPhaseDiagnostic(),
+    fallback: createTranslationPhaseDiagnostic(),
+  };
+}
+
+function createTranslationDiagnostics() {
+  return {
+    pendingTitleCount: 0,
+    translatedCount: 0,
+    primary: createTranslationPhaseDiagnostic(),
+    fallback: createTranslationPhaseDiagnostic(),
+    jobs: new Map(),
+  };
+}
+
+function normalizeFailureReason(reason) {
+  if ([
+    'timeout',
+    'network',
+    'http_error',
+    'bad_payload',
+    'empty_result',
+    'non_chinese_result',
+  ].includes(reason)) {
+    return reason;
+  }
+
+  return null;
+}
+
+function classifyTranslationFailureReason(error) {
+  const message = normalizeTitle(error?.message ?? String(error ?? ''));
+
+  if (!message) {
+    return 'network';
+  }
+
+  if (/(?:timeout|timed out|超时|abort)/i.test(message)) {
+    return 'timeout';
+  }
+
+  if (/(?:payload|json|parse|解析|格式|translations|数量不匹配|格式异常)/i.test(message)) {
+    return 'bad_payload';
+  }
+
+  if (/(?:empty|为空|空结果)/i.test(message)) {
+    return 'empty_result';
+  }
+
+  if (/(?:network|fetch|econn|socket|dns|连接|联网)/i.test(message)) {
+    return 'network';
+  }
+
+  if (/(?:\b4\d{2}\b|\b5\d{2}\b|http|status|服务)/i.test(message)) {
+    return 'http_error';
+  }
+
+  return 'network';
+}
+
+function getTranslationResultFailureReason(job, translatedTitle) {
+  const normalizedTranslatedTitle = normalizeTitle(translatedTitle);
+
+  if (!normalizedTranslatedTitle) {
+    return 'empty_result';
+  }
+
+  if (!shouldPersistTranslatedTitle(job.title, normalizedTranslatedTitle)) {
+    return 'non_chinese_result';
+  }
+
+  if (!isUsableTranslatedChineseTitle(normalizedTranslatedTitle)) {
+    return 'non_chinese_result';
+  }
+
+  return null;
+}
+
+function ensureTranslationJobDiagnostic(runtime, jobKey) {
+  const diagnostics = runtime.translationDiagnostics;
+
+  if (!diagnostics.jobs.has(jobKey)) {
+    diagnostics.jobs.set(jobKey, createTranslationJobDiagnostic());
+    diagnostics.pendingTitleCount += 1;
+  }
+
+  return diagnostics.jobs.get(jobKey);
+}
+
+function registerTranslationJobs(runtime, jobs) {
+  for (const job of jobs) {
+    if (isMeaningfulText(job?.jobKey)) {
+      ensureTranslationJobDiagnostic(runtime, job.jobKey);
+    }
+  }
+}
+
+function markTranslationPhaseAttempt(runtime, phaseName, jobKey) {
+  const diagnostics = runtime.translationDiagnostics;
+
+  if (diagnostics[phaseName]) {
+    diagnostics[phaseName].attempted = true;
+  }
+
+  if (isMeaningfulText(jobKey)) {
+    ensureTranslationJobDiagnostic(runtime, jobKey)[phaseName].attempted = true;
+  }
+}
+
+function markTranslationPhaseSuccess(runtime, phaseName, jobKey) {
+  const diagnostics = runtime.translationDiagnostics;
+
+  if (diagnostics[phaseName]) {
+    diagnostics[phaseName].attempted = true;
+    diagnostics[phaseName].succeeded = true;
+    diagnostics[phaseName].reason = null;
+  }
+
+  if (isMeaningfulText(jobKey)) {
+    const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
+    jobDiagnostics[phaseName].attempted = true;
+    jobDiagnostics[phaseName].succeeded = true;
+    jobDiagnostics[phaseName].reason = null;
+    jobDiagnostics.translated = true;
+    jobDiagnostics.finalFailure = false;
+  }
+}
+
+function markTranslationPhaseFailure(runtime, phaseName, jobKey, reason) {
+  const normalizedReason = normalizeFailureReason(reason) ?? 'network';
+  const diagnostics = runtime.translationDiagnostics;
+
+  if (diagnostics[phaseName]) {
+    diagnostics[phaseName].attempted = true;
+
+    if (!diagnostics[phaseName].succeeded && !diagnostics[phaseName].reason) {
+      diagnostics[phaseName].reason = normalizedReason;
+    }
+  }
+
+  if (isMeaningfulText(jobKey)) {
+    const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
+    jobDiagnostics[phaseName].attempted = true;
+
+    if (!jobDiagnostics[phaseName].succeeded) {
+      jobDiagnostics[phaseName].reason = normalizedReason;
+    }
+  }
+}
+
+function markTranslationCachedSuccess(runtime, jobKey) {
+  const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
+  jobDiagnostics.translated = true;
+  jobDiagnostics.finalFailure = false;
+}
+
+function markTranslationFinalFailure(runtime, jobKey, diagnostic = {}) {
+  const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
+  const primaryReason = normalizeFailureReason(diagnostic.primaryReason);
+  const fallbackReason = normalizeFailureReason(diagnostic.fallbackReason);
+
+  if (primaryReason) {
+    jobDiagnostics.primary.attempted = true;
+    jobDiagnostics.primary.reason = primaryReason;
+  }
+
+  if (fallbackReason) {
+    jobDiagnostics.fallback.attempted = true;
+    jobDiagnostics.fallback.reason = fallbackReason;
+  }
+
+  if (!jobDiagnostics.translated) {
+    jobDiagnostics.finalFailure = true;
+  }
+}
+
+function buildTranslationFailureDiagnostic(runtime, jobKey) {
+  const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
+
+  return {
+    primaryReason: normalizeFailureReason(jobDiagnostics.primary.reason),
+    fallbackReason: normalizeFailureReason(jobDiagnostics.fallback.reason),
+  };
+}
+
+function finalizeTranslationDiagnostics(runtime) {
+  runtime.translationDiagnostics.translatedCount = Array.from(runtime.translationDiagnostics.jobs.values())
+    .filter((jobDiagnostics) => jobDiagnostics.translated)
+    .length;
+}
+
+function formatTranslationFailureReason(reason) {
+  switch (reason) {
+    case 'timeout':
+      return '超时';
+    case 'network':
+      return '网络';
+    case 'http_error':
+      return '接口';
+    case 'bad_payload':
+      return '返回异常';
+    case 'empty_result':
+      return '空结果';
+    case 'non_chinese_result':
+      return '未转中文';
+    default:
+      return '';
+  }
+}
+
+function buildTranslationFailureNote(jobDiagnostics) {
+  const primaryReasonText = formatTranslationFailureReason(jobDiagnostics?.primary?.reason);
+  const fallbackReasonText = formatTranslationFailureReason(jobDiagnostics?.fallback?.reason);
+
+  if (primaryReasonText || fallbackReasonText) {
+    const fragments = [];
+
+    if (primaryReasonText) {
+      fragments.push(`主:${primaryReasonText}`);
+    }
+
+    if (fallbackReasonText) {
+      fragments.push(`备:${fallbackReasonText}`);
+    }
+
+    return `[翻译] 主代理与备用直连均失败（${fragments.join(' / ')}），已回退原文`;
+  }
+
+  return '[翻译] 主代理与备用直连均失败，已回退原文';
 }
 
 async function withCacheLock(cacheState, operation) {
@@ -1819,11 +2078,18 @@ async function requestTranslationBatch(items, translationConfig, runtime, { stri
         headers: {
           'Content-Type': 'application/json',
         },
+        timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
       },
     );
 
     if (Array.isArray(response?.translations)) {
-      return response.translations.map((value) => normalizeTitle(String(value)));
+      const translations = response.translations.map((value) => normalizeTitle(String(value)));
+
+      if (translations.length !== items.length) {
+        throw new Error('翻译代理返回数量不匹配');
+      }
+
+      return translations;
     }
 
     throw new Error('翻译代理返回格式异常');
@@ -1865,8 +2131,15 @@ async function requestTranslationBatch(items, translationConfig, runtime, { stri
 
   const content = response?.choices?.[0]?.message?.content ?? '';
   const parsedTranslations = parseTranslationResponseContent(content, items.length);
+  if (!parsedTranslations.length) {
+    throw new Error('翻译结果为空');
+  }
 
-  return items.map((item, index) => normalizeTitle(parsedTranslations[index]) || item.title);
+  if (parsedTranslations.length !== items.length) {
+    throw new Error('翻译结果数量不匹配');
+  }
+
+  return parsedTranslations.map((value) => normalizeTitle(value));
 }
 
 async function requestTranslationBatchWithBackoff(batch, translationConfig, runtime, { strict = false } = {}) {
@@ -1981,28 +2254,6 @@ async function requestOverviewBatchWithBackoff(batch, translationConfig, runtime
   };
 }
 
-function collectUntranslatedEntries(batch, translatedBatch) {
-  return batch
-    .map((item, index) => ({
-      job: item,
-      translatedTitle: normalizeTitle(translatedBatch[index]) || item.title,
-      index,
-    }))
-    .filter(({ job, translatedTitle }) => {
-      const normalizedSource = normalizeTitle(job.title);
-
-      if (!normalizedSource) {
-        return false;
-      }
-
-      if (isUsableTranslatedChineseTitle(translatedTitle)) {
-        return false;
-      }
-
-      return !containsHan(normalizedSource) || containsNonChineseScript(normalizedSource);
-    });
-}
-
 function collectUntranslatedOverviewEntries(batch, translatedBatch) {
   return batch
     .map((item, index) => ({
@@ -2042,55 +2293,119 @@ async function persistSuccessfulOverviewTranslation(runtime, cacheKey, translate
   });
 }
 
-async function persistFailedTranslation(runtime, cacheKey) {
+async function persistFailedTranslation(runtime, cacheKey, diagnostic = null) {
   queueRuntimeCacheWrite(runtime, {
     cacheKey,
-    value: { status: 'failed' },
+    value: { status: 'failed', diagnostic },
     namespace: CACHE_NAMESPACE_TRANSLATE,
     ttlSeconds: TRANSLATION_FAILURE_CACHE_TTL_SECONDS,
   });
 }
 
-async function translateSingleJobWithFallback(job, primaryConfig, runtime) {
-  let translatedTitle = '';
-  let requestSucceeded = false;
-
+async function translateSingleJobWithFallback(
+  job,
+  primaryConfig,
+  runtime,
+  { primaryPhaseName = 'primary', fallbackPhaseName = 'fallback' } = {},
+) {
   if (hasTranslationConfig(primaryConfig)) {
+    markTranslationPhaseAttempt(runtime, primaryPhaseName, job.jobKey);
     const primaryResult = await requestTranslationBatchWithBackoff([job], primaryConfig, runtime, { strict: true });
-    const primaryTitle = normalizeTitle(primaryResult.translatedBatch[0]) || job.title;
+    const primaryTitle = normalizeTitle(primaryResult.translatedBatch[0]);
+    const primaryReason = primaryResult.requestSucceeded
+      ? getTranslationResultFailureReason(job, primaryTitle)
+      : classifyTranslationFailureReason(primaryResult.error);
 
-    if (isUsableTranslatedChineseTitle(primaryTitle)) {
+    if (!primaryReason) {
+      markTranslationPhaseSuccess(runtime, primaryPhaseName, job.jobKey);
       return {
         translatedTitle: primaryTitle,
-        requestSucceeded: primaryResult.requestSucceeded,
+        requestSucceeded: true,
       };
     }
 
-    requestSucceeded = requestSucceeded || primaryResult.requestSucceeded;
+    markTranslationPhaseFailure(runtime, primaryPhaseName, job.jobKey, primaryReason);
   }
 
-  if (hasTranslationConfig(runtime.fallbackTranslationConfig)) {
+  if (
+    hasTranslationConfig(runtime.fallbackTranslationConfig)
+    && !isSameTranslationConfig(primaryConfig, runtime.fallbackTranslationConfig)
+  ) {
+    markTranslationPhaseAttempt(runtime, fallbackPhaseName, job.jobKey);
     const fallbackResult = await requestTranslationBatchWithBackoff(
       [job],
       runtime.fallbackTranslationConfig,
       runtime,
       { strict: true },
     );
-    translatedTitle = normalizeTitle(fallbackResult.translatedBatch[0]) || job.title;
-    requestSucceeded = requestSucceeded || fallbackResult.requestSucceeded;
+    const fallbackTitle = normalizeTitle(fallbackResult.translatedBatch[0]);
+    const fallbackReason = fallbackResult.requestSucceeded
+      ? getTranslationResultFailureReason(job, fallbackTitle)
+      : classifyTranslationFailureReason(fallbackResult.error);
 
-    if (isUsableTranslatedChineseTitle(translatedTitle)) {
+    if (!fallbackReason) {
+      markTranslationPhaseSuccess(runtime, fallbackPhaseName, job.jobKey);
       return {
-        translatedTitle,
-        requestSucceeded,
+        translatedTitle: fallbackTitle,
+        requestSucceeded: true,
       };
     }
+
+    markTranslationPhaseFailure(runtime, fallbackPhaseName, job.jobKey, fallbackReason);
   }
 
   return {
     translatedTitle: '',
-    requestSucceeded,
+    requestSucceeded: false,
   };
+}
+
+async function translateJobsByBatches(jobs, translationConfig, runtime, translatedMap, phaseName) {
+  if (!jobs.length || !hasTranslationConfig(translationConfig)) {
+    return [...jobs];
+  }
+
+  const unresolvedJobs = [];
+  const batches = chunkArray(jobs, TRANSLATION_LARGE_BATCH_SIZE);
+
+  for (const [batchIndex, batch] of batches.entries()) {
+    for (const job of batch) {
+      markTranslationPhaseAttempt(runtime, phaseName, job.jobKey);
+    }
+
+    const result = await requestTranslationBatchWithBackoff(batch, translationConfig, runtime);
+
+    if (!result.requestSucceeded) {
+      const failureReason = classifyTranslationFailureReason(result.error);
+
+      for (const job of batch) {
+        markTranslationPhaseFailure(runtime, phaseName, job.jobKey, failureReason);
+        unresolvedJobs.push(job);
+      }
+    } else {
+      for (const [itemIndex, job] of batch.entries()) {
+        const translatedTitle = normalizeTitle(result.translatedBatch[itemIndex]);
+        const failureReason = getTranslationResultFailureReason(job, translatedTitle);
+
+        if (!failureReason) {
+          const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
+          translatedMap.set(job.jobKey, translatedTitle);
+          markTranslationPhaseSuccess(runtime, phaseName, job.jobKey);
+          await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
+          continue;
+        }
+
+        markTranslationPhaseFailure(runtime, phaseName, job.jobKey, failureReason);
+        unresolvedJobs.push(job);
+      }
+    }
+
+    if (getTimerFunctions().setTimeout && batchIndex + 1 < batches.length) {
+      await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
+    }
+  }
+
+  return unresolvedJobs;
 }
 
 async function translateTitlesWithCache(jobs, translationConfig, runtime) {
@@ -2107,6 +2422,7 @@ async function translateTitlesWithCache(jobs, translationConfig, runtime) {
   );
   const translatedMap = new Map();
   const missingJobs = [];
+  registerTranslationJobs(runtime, dedupedJobs);
 
   for (const job of dedupedJobs) {
     const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
@@ -2114,98 +2430,68 @@ async function translateTitlesWithCache(jobs, translationConfig, runtime) {
 
     if (cachedValue?.translatedTitle) {
       translatedMap.set(job.jobKey, normalizeTitle(cachedValue.translatedTitle));
+      markTranslationCachedSuccess(runtime, job.jobKey);
       continue;
     }
 
     if (cachedValue?.status === 'failed') {
+      markTranslationFinalFailure(runtime, job.jobKey, cachedValue?.diagnostic);
       continue;
     }
 
     missingJobs.push(job);
   }
 
-  if (isTranslationProxyMode(translationConfig) && missingJobs.length) {
-    const { translatedBatch } = await requestTranslationBatchWithBackoff(missingJobs, translationConfig, runtime);
-    const unresolvedEntries = collectUntranslatedEntries(missingJobs, translatedBatch);
-    const unresolvedJobKeys = new Set(unresolvedEntries.map((entry) => entry.job.jobKey));
+  let unresolvedJobs = [...missingJobs];
 
-    for (const [batchIndex, job] of missingJobs.entries()) {
-      const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || job.title;
-      const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
-
-      if (!unresolvedJobKeys.has(job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
-        translatedMap.set(job.jobKey, translatedTitle);
-        await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
-      } else {
-        await persistFailedTranslation(runtime, cacheKey);
-      }
-    }
-
-    return translatedMap;
+  if (unresolvedJobs.length) {
+    unresolvedJobs = await translateJobsByBatches(
+      unresolvedJobs,
+      translationConfig,
+      runtime,
+      translatedMap,
+      'primary',
+    );
   }
 
-  for (let largeIndex = 0; largeIndex < missingJobs.length; largeIndex += TRANSLATION_LARGE_BATCH_SIZE) {
-    const largeBatch = missingJobs.slice(largeIndex, largeIndex + TRANSLATION_LARGE_BATCH_SIZE);
-    const { translatedBatch } = hasTranslationConfig(translationConfig)
-      ? await requestTranslationBatchWithBackoff(largeBatch, translationConfig, runtime)
-      : {
-        translatedBatch: largeBatch.map((job) => job.title),
-      };
-    const unresolvedLargeEntries = collectUntranslatedEntries(largeBatch, translatedBatch);
-    const unresolvedJobKeys = new Set(unresolvedLargeEntries.map((entry) => entry.job.jobKey));
-    const unresolvedJobs = [];
+  if (isTranslationProxyMode(translationConfig) && unresolvedJobs.length) {
+    unresolvedJobs = await translateJobsByBatches(
+      unresolvedJobs,
+      runtime.fallbackTranslationConfig,
+      runtime,
+      translatedMap,
+      'fallback',
+    );
+  }
 
-    for (const [batchIndex, job] of largeBatch.entries()) {
-      const translatedTitle = normalizeTitle(translatedBatch[batchIndex]) || job.title;
+  if (unresolvedJobs.length) {
+    for (const job of unresolvedJobs) {
       const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
+      const singlePrimaryConfig = isTranslationProxyMode(translationConfig)
+        ? runtime.fallbackTranslationConfig
+        : translationConfig;
+      const singleResult = await translateSingleJobWithFallback(
+        job,
+        singlePrimaryConfig,
+        runtime,
+        isTranslationProxyMode(translationConfig)
+          ? { primaryPhaseName: 'fallback', fallbackPhaseName: 'fallback' }
+          : undefined,
+      );
 
-      if (!unresolvedJobKeys.has(job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
-        translatedMap.set(job.jobKey, translatedTitle);
-        await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
-      } else {
-        unresolvedJobs.push(job);
-      }
-    }
-
-    for (let smallIndex = 0; smallIndex < unresolvedJobs.length; smallIndex += TRANSLATION_BATCH_SIZE) {
-      const smallBatch = unresolvedJobs.slice(smallIndex, smallIndex + TRANSLATION_BATCH_SIZE);
-      const { translatedBatch: translatedSmallBatch } = hasTranslationConfig(translationConfig)
-        ? await requestTranslationBatchWithBackoff(smallBatch, translationConfig, runtime)
-        : {
-          translatedBatch: smallBatch.map((job) => job.title),
-        };
-      const unresolvedSmallEntries = collectUntranslatedEntries(smallBatch, translatedSmallBatch);
-      const unresolvedSmallKeys = new Set(unresolvedSmallEntries.map((entry) => entry.job.jobKey));
-
-      for (const [batchIndex, job] of smallBatch.entries()) {
-        const translatedTitle = normalizeTitle(translatedSmallBatch[batchIndex]) || job.title;
-        const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
-
-        if (!unresolvedSmallKeys.has(job.jobKey) && shouldPersistTranslatedTitle(job.title, translatedTitle)) {
-          translatedMap.set(job.jobKey, translatedTitle);
-          await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
-          continue;
-        }
-
-        const singleResult = await translateSingleJobWithFallback(job, translationConfig, runtime);
-        if (isUsableTranslatedChineseTitle(singleResult.translatedTitle)) {
-          translatedMap.set(job.jobKey, singleResult.translatedTitle);
-          await persistSuccessfulTitleTranslation(runtime, cacheKey, singleResult.translatedTitle);
-        } else {
-          await persistFailedTranslation(runtime, cacheKey);
-        }
+      if (isUsableTranslatedChineseTitle(singleResult.translatedTitle)) {
+        translatedMap.set(job.jobKey, singleResult.translatedTitle);
+        await persistSuccessfulTitleTranslation(runtime, cacheKey, singleResult.translatedTitle);
+        continue;
       }
 
-      if (getTimerFunctions().setTimeout && smallIndex + TRANSLATION_BATCH_SIZE < unresolvedJobs.length) {
-        await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
-      }
-    }
-
-    if (getTimerFunctions().setTimeout && largeIndex + TRANSLATION_LARGE_BATCH_SIZE < missingJobs.length) {
-      await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
+      const diagnostic = buildTranslationFailureDiagnostic(runtime, job.jobKey);
+      markTranslationFinalFailure(runtime, job.jobKey, diagnostic);
+      await persistFailedTranslation(runtime, cacheKey, diagnostic);
     }
   }
 
+  finalizeTranslationDiagnostics(runtime);
   return translatedMap;
 }
 
@@ -2361,6 +2647,10 @@ function shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse) {
   return (simplifiedResponse?.results ?? []).some((item) => !isUsableTmdbChineseTitle(getRawTitle(item, mediaType)));
 }
 
+function hasLocalizedChineseCatalogTitle(record) {
+  return isUsableTmdbChineseTitle(record?.simplifiedTitle) || isUsableTmdbChineseTitle(record?.traditionalTitle);
+}
+
 function createRuntime(rawParams, overrides = {}) {
   const storage = overrides.storage ?? getDefaultStorage();
   const cacheMaxBytes = overrides.cacheOptions?.maxBytes ?? CACHE_MAX_BYTES;
@@ -2372,6 +2662,7 @@ function createRuntime(rawParams, overrides = {}) {
     cacheMaxBytes,
     cacheState: createCacheState(storage, cacheMaxBytes),
     requestMemo: createRequestMemo(),
+    translationDiagnostics: createTranslationDiagnostics(),
     translationConfig: normalizeTranslationConfig(rawParams),
     fallbackTranslationConfig: buildFallbackTranslationConfig(),
   };
@@ -2387,7 +2678,7 @@ async function fetchLocalizedPage({ mediaType, categoryId, rule, sortKey, source
     },
   }, runtime);
 
-  if (!isChineseCategory(categoryId) && shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
+  if (shouldFetchTraditionalForDiscoverPage(mediaType, simplifiedResponse)) {
     const traditionalResponse = await cachedTmdbGet(endpoint, {
       params: {
         ...commonParams,
@@ -2650,6 +2941,27 @@ function buildDescriptionText(parts, overview) {
   return header || normalizedOverview || undefined;
 }
 
+function applyTranslationFailureNotes(records, runtime) {
+  if (!Array.isArray(records) || !records.length) {
+    return records;
+  }
+
+  for (const record of records) {
+    if (!shouldAttemptMachineTranslation(record)) {
+      continue;
+    }
+
+    const jobDiagnostics = runtime.translationDiagnostics.jobs.get(buildTranslationJob(record).jobKey);
+
+    if (jobDiagnostics?.finalFailure) {
+      record.translationFailureNote = buildTranslationFailureNote(jobDiagnostics);
+    }
+  }
+
+  finalizeTranslationDiagnostics(runtime);
+  return records;
+}
+
 function buildDetailItem(record, link, description, { childItems = [], genreTitle } = {}) {
   return {
     id: String(record.tmdbId),
@@ -2687,6 +2999,11 @@ function buildChildDetailItem(record, link, description, { mediaType = record.me
 function mapRecordToVideoItem(record, categoryTitle) {
   const detailText = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
   const overview = normalizeTitle(record.overview) || '暂无简介';
+  const descriptionLines = [detailText, overview];
+
+  if (isMeaningfulText(record.translationFailureNote)) {
+    descriptionLines.push(record.translationFailureNote);
+  }
 
   return {
     id: String(record.tmdbId),
@@ -2698,9 +3015,7 @@ function mapRecordToVideoItem(record, categoryTitle) {
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
-    description: detailText
-      ? `${detailText}\n${overview}`
-      : overview,
+    description: descriptionLines.filter(Boolean).join('\n') || undefined,
   };
 }
 
@@ -3124,6 +3439,12 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
           continue;
         }
 
+        // 分类墙先走“TMDb 自带中文优先”的极速路径。
+        // 没有简体或繁体中文标题的条目直接过滤，不再触发列表翻译。
+        if (!hasLocalizedChineseCatalogTitle(record)) {
+          continue;
+        }
+
         // 合并 movie/tv 大类时，TMDb 数字 id 可能跨媒体类型重复，必须把媒体类型一起算入去重键。
         const recordKey = `${record.mediaType}:${record.tmdbId}`;
         if (seenRecordKeys.has(recordKey)) {
@@ -3154,10 +3475,6 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const endIndex = startIndex + params.count;
   const categoryTitle = selectedScopes[0].rule.title;
   const pagedRecords = sorted.slice(startIndex, endIndex);
-
-  if (!isChineseCategory(params.categoryId)) {
-    await applyMachineTranslationFallback(pagedRecords, runtime.translationConfig, runtime);
-  }
 
   await flushQueuedCacheWrites(runtime);
   return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
