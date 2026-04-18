@@ -438,7 +438,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.6",
+  version: "0.5.7",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -2748,18 +2748,118 @@ function isChineseCategory(categoryId) {
   return categoryId === 'chinese_movie' || categoryId === 'chinese_series';
 }
 
+const LOCALIZED_TITLE_PAGINATION_BACKTRACK_PAGES = 2;
+const LOCALIZED_TITLE_PAGINATION_BACKTRACK_MAX_PAGE = 3;
+
 function getRemotePaginationPlan(params) {
   const offset = (params.page - 1) * params.count;
-  const sourceStartPage = Math.floor(offset / TMDB_PAGE_SIZE) + 1;
-  const localSkip = offset % TMDB_PAGE_SIZE;
+  const estimatedSourceStartPage = Math.floor(offset / TMDB_PAGE_SIZE) + 1;
+  const backtrackPages = params.page <= LOCALIZED_TITLE_PAGINATION_BACKTRACK_MAX_PAGE
+    ? Math.min(
+      Math.max(params.page - 1, 0),
+      LOCALIZED_TITLE_PAGINATION_BACKTRACK_PAGES,
+    )
+    : 0;
+  const sourceStartPage = Math.max(1, estimatedSourceStartPage - backtrackPages);
+  const estimatedItemsBeforeWindow = (sourceStartPage - 1) * TMDB_PAGE_SIZE;
+  const localSkip = Math.max(0, offset - estimatedItemsBeforeWindow);
   const requestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
 
   return {
     sourceStartPage,
     localSkip,
     neededCollectedCount: localSkip + params.count,
-    maxRounds: requestedSourcePages + PAGINATION_FORWARD_FILL_LIMIT_PAGES,
+    maxRounds: requestedSourcePages + PAGINATION_FORWARD_FILL_LIMIT_PAGES + backtrackPages,
   };
+}
+
+function buildSelectedScopes(categoryId, sourceMediaTypes, startPage) {
+  return sourceMediaTypes
+    .map((mediaType) => ({
+      mediaType,
+      rule: getRuleById(mediaType, categoryId),
+      nextPage: startPage,
+      totalPages: 0,
+      exhausted: false,
+    }))
+    .filter((scope) => scope.rule);
+}
+
+async function collectCatalogRecords({
+  params,
+  runtime,
+  todayDate,
+  selectedScopes,
+  neededCollectedCount,
+  maxRounds,
+}) {
+  const collected = [];
+  const seenRecordKeys = new Set();
+  let fetchedRounds = 0;
+
+  while (selectedScopes.some((scope) => !scope.exhausted) && fetchedRounds < maxRounds) {
+    fetchedRounds += 1;
+    const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
+    const pageResults = await Promise.all(
+      activeScopes.map((scope) =>
+        fetchLocalizedPage({
+          mediaType: scope.mediaType,
+          categoryId: params.categoryId,
+          rule: scope.rule,
+          sortKey: params.sortKey,
+          sourcePage: scope.nextPage,
+          runtime,
+          todayDate,
+        }),
+      ),
+    );
+
+    for (const [index, scope] of activeScopes.entries()) {
+      const { results, totalPages } = pageResults[index];
+      scope.totalPages = totalPages;
+
+      for (const record of results) {
+        if (!isAllowedRecord(record, todayDate, params.categoryId, params.sortKey)) {
+          continue;
+        }
+
+        const matchedRule = classifyMediaRecord(scope.mediaType, record);
+
+        if (!matchedRule || matchedRule.id !== scope.rule.id) {
+          continue;
+        }
+
+        // 分类墙先走“TMDb 自带中文优先”的极速路径。
+        // 没有简体或繁体中文标题的条目直接过滤，不再触发列表翻译。
+        if (!hasLocalizedChineseCatalogTitle(record)) {
+          continue;
+        }
+
+        const recordKey = `${record.mediaType}:${record.tmdbId}`;
+        if (seenRecordKeys.has(recordKey)) {
+          continue;
+        }
+
+        seenRecordKeys.add(recordKey);
+        collected.push(record);
+      }
+
+      const reachedRemoteEnd = !results.length || (totalPages > 0 && scope.nextPage >= totalPages);
+
+      if (reachedRemoteEnd) {
+        scope.exhausted = true;
+        continue;
+      }
+
+      scope.nextPage += 1;
+    }
+
+    if (collected.length >= neededCollectedCount) {
+      break;
+    }
+  }
+
+  return collected;
 }
 
 function classifyMediaRecord(mediaType, record) {
@@ -3387,87 +3487,45 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const todayDate = getTodayDateString();
   const fetchPlan = getRemotePaginationPlan(params);
   const sourceMediaTypes = getCategoryMediaTypes(params.categoryId);
-  const selectedScopes = sourceMediaTypes
-    .map((mediaType) => ({
-      mediaType,
-      rule: getRuleById(mediaType, params.categoryId),
-      nextPage: fetchPlan.sourceStartPage,
-      totalPages: 0,
-      exhausted: false,
-    }))
-    .filter((scope) => scope.rule);
+  const selectedScopes = buildSelectedScopes(
+    params.categoryId,
+    sourceMediaTypes,
+    fetchPlan.sourceStartPage,
+  );
 
   if (!selectedScopes.length) {
     throw new Error(`未知分类：${params.categoryId}`);
   }
 
-  const collected = [];
-  const seenRecordKeys = new Set();
-  let fetchedRounds = 0;
+  let collected = await collectCatalogRecords({
+    params,
+    runtime,
+    todayDate,
+    selectedScopes,
+    neededCollectedCount: fetchPlan.neededCollectedCount,
+    maxRounds: fetchPlan.maxRounds,
+  });
 
-  // 统一按“当前页窗口 + 顺延补抓”的思路抓取。
-  // 不再为后页请求回头重扫第 1 页，避免翻页越翻越慢。
-  while (selectedScopes.some((scope) => !scope.exhausted) && fetchedRounds < fetchPlan.maxRounds) {
-    fetchedRounds += 1;
-    const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
-    const pageResults = await Promise.all(
-      activeScopes.map((scope) =>
-        fetchLocalizedPage({
-          mediaType: scope.mediaType,
-          categoryId: params.categoryId,
-          rule: scope.rule,
-          sortKey: params.sortKey,
-          sourcePage: scope.nextPage,
-          runtime,
-          todayDate,
-        }),
-      ),
-    );
+  // 只保留中文标题后，某些分类前几页的命中密度会明显下降。
+  // 若快路径连当前页起点都凑不齐，就退回到从第 1 页补救重扫，避免用户只能翻到一页。
+  const rescueNeededCount = ((params.page - 1) * params.count) + params.count;
+  const rescueMaxRounds = Math.max(
+    fetchPlan.maxRounds,
+    Math.ceil(rescueNeededCount / 2),
+  );
 
-    for (const [index, scope] of activeScopes.entries()) {
-      const { results, totalPages } = pageResults[index];
-      scope.totalPages = totalPages;
-
-      for (const record of results) {
-        if (!isAllowedRecord(record, todayDate, params.categoryId, params.sortKey)) {
-          continue;
-        }
-
-        const matchedRule = classifyMediaRecord(scope.mediaType, record);
-
-        if (!matchedRule || matchedRule.id !== scope.rule.id) {
-          continue;
-        }
-
-        // 分类墙先走“TMDb 自带中文优先”的极速路径。
-        // 没有简体或繁体中文标题的条目直接过滤，不再触发列表翻译。
-        if (!hasLocalizedChineseCatalogTitle(record)) {
-          continue;
-        }
-
-        // 合并 movie/tv 大类时，TMDb 数字 id 可能跨媒体类型重复，必须把媒体类型一起算入去重键。
-        const recordKey = `${record.mediaType}:${record.tmdbId}`;
-        if (seenRecordKeys.has(recordKey)) {
-          continue;
-        }
-
-        seenRecordKeys.add(recordKey);
-        collected.push(record);
-      }
-
-      const reachedRemoteEnd = !results.length || (totalPages > 0 && scope.nextPage >= totalPages);
-
-      if (reachedRemoteEnd) {
-        scope.exhausted = true;
-        continue;
-      }
-
-      scope.nextPage += 1;
-    }
-
-    if (collected.length >= fetchPlan.neededCollectedCount) {
-      break;
-    }
+  if (
+    collected.length < fetchPlan.neededCollectedCount
+    && (fetchPlan.sourceStartPage > 1 || rescueMaxRounds > fetchPlan.maxRounds)
+  ) {
+    collected = await collectCatalogRecords({
+      params,
+      runtime,
+      todayDate,
+      selectedScopes: buildSelectedScopes(params.categoryId, sourceMediaTypes, 1),
+      neededCollectedCount: rescueNeededCount,
+      maxRounds: rescueMaxRounds,
+    });
   }
 
   const sorted = sortCatalogRecords(collected, params.sortKey);
