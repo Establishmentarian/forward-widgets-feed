@@ -18,6 +18,7 @@ const DEFAULT_PAGE = 1;
 const MAX_COUNT = 60;
 const TMDB_PAGE_SIZE = 20;
 const MAX_SOURCE_PAGES = 5;
+const CATALOG_SOURCE_FETCH_CONCURRENCY = 4;
 const PAGINATION_FORWARD_FILL_LIMIT_PAGES = 8;
 const CACHE_MAX_BYTES = 500 * 1024 * 1024;
 const CACHE_NAMESPACE_TMDB = 'cache:tmdb';
@@ -438,7 +439,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.8",
+  version: "0.5.9",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -2734,10 +2735,6 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
   return true;
 }
 
-function isChineseCategory(categoryId) {
-  return categoryId === 'chinese_movie' || categoryId === 'chinese_series';
-}
-
 const LOCALIZED_TITLE_PAGINATION_BACKTRACK_PAGES = 2;
 const LOCALIZED_TITLE_PAGINATION_BACKTRACK_MAX_PAGE = 3;
 
@@ -2773,6 +2770,45 @@ function buildSelectedScopes(categoryId, sourceMediaTypes, startPage) {
       exhausted: false,
     }))
     .filter((scope) => scope.rule);
+}
+
+function buildSourcePageBatch(selectedScopes, batchSize) {
+  const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
+  const nextPages = new Map(activeScopes.map((scope) => [scope, scope.nextPage]));
+  const batchTasks = [];
+
+  while (batchTasks.length < batchSize) {
+    let addedInPass = false;
+
+    for (const scope of activeScopes) {
+      const nextPage = nextPages.get(scope);
+
+      if (!Number.isFinite(nextPage)) {
+        continue;
+      }
+
+      if (scope.totalPages > 0 && nextPage > scope.totalPages) {
+        continue;
+      }
+
+      batchTasks.push({
+        scope,
+        sourcePage: nextPage,
+      });
+      nextPages.set(scope, nextPage + 1);
+      addedInPass = true;
+
+      if (batchTasks.length >= batchSize) {
+        break;
+      }
+    }
+
+    if (!addedInPass) {
+      break;
+    }
+  }
+
+  return batchTasks;
 }
 
 function resolveCatalogDisplayTitle(record) {
@@ -2846,31 +2882,47 @@ async function collectCatalogRecords({
   selectedScopes,
   neededCollectedCount,
   maxRounds,
+  allowTraditionalSupplement = true,
+  sourceFetchConcurrency = CATALOG_SOURCE_FETCH_CONCURRENCY,
 }) {
   const collected = [];
   const seenRecordKeys = new Set();
-  let fetchedRounds = 0;
+  let fetchedSourcePages = 0;
 
-  while (selectedScopes.some((scope) => !scope.exhausted) && fetchedRounds < maxRounds) {
-    fetchedRounds += 1;
-    const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
+  while (selectedScopes.some((scope) => !scope.exhausted) && fetchedSourcePages < maxRounds) {
+    const isFirstBatch = fetchedSourcePages === 0;
+    const batchSize = isFirstBatch
+      ? Math.min(sourceFetchConcurrency, selectedScopes.filter((scope) => !scope.exhausted).length)
+      : Math.min(sourceFetchConcurrency, maxRounds - fetchedSourcePages);
+    const batchTasks = buildSourcePageBatch(
+      selectedScopes,
+      batchSize,
+    );
+
+    if (!batchTasks.length) {
+      break;
+    }
+
+    fetchedSourcePages += batchTasks.length;
     const simplifiedResponses = await Promise.all(
-      activeScopes.map((scope) =>
+      batchTasks.map(({ scope, sourcePage }) =>
         fetchCatalogSimplifiedPage({
           mediaType: scope.mediaType,
           categoryId: params.categoryId,
           rule: scope.rule,
           sortKey: params.sortKey,
-          sourcePage: scope.nextPage,
+          sourcePage,
           runtime,
           todayDate,
         }),
       ),
     );
+    const scopeBatchStates = new Map();
 
-    for (const [index, scope] of activeScopes.entries()) {
+    for (const [index, task] of batchTasks.entries()) {
       const simplifiedResponse = simplifiedResponses[index] ?? {};
-      scope.totalPages = simplifiedResponse.total_pages ?? 0;
+      const scope = task.scope;
+      scope.totalPages = Math.max(scope.totalPages ?? 0, simplifiedResponse.total_pages ?? 0);
 
       let mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, {});
       let candidateRecords = collectCatalogCandidateRecords(
@@ -2882,15 +2934,18 @@ async function collectCatalogRecords({
         todayDate,
       );
 
-      // 列表页只对“真正可能进入当前分类墙”的候选条目按需补抓繁体；
-      // 非候选的外文条目不会再触发整页 zh-TW 请求。
-      if (shouldSupplementCatalogTraditionalPage(candidateRecords, collected.length, neededCollectedCount)) {
+      // 当前批次内只对“真正会落入当前分类”的候选页按需补抓 zh-TW。
+      // 补救扫描阶段会关闭这条路径，只跑 zh-CN。
+      if (
+        allowTraditionalSupplement
+        && shouldSupplementCatalogTraditionalPage(candidateRecords, collected.length, neededCollectedCount)
+      ) {
         const traditionalResponse = await fetchCatalogTraditionalPage({
           mediaType: scope.mediaType,
           categoryId: params.categoryId,
           rule: scope.rule,
           sortKey: params.sortKey,
-          sourcePage: scope.nextPage,
+          sourcePage: task.sourcePage,
           runtime,
           todayDate,
         });
@@ -2908,14 +2963,34 @@ async function collectCatalogRecords({
 
       collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected);
 
-      const reachedRemoteEnd = !(simplifiedResponse.results?.length) || (scope.totalPages > 0 && scope.nextPage >= scope.totalPages);
+      if (!scopeBatchStates.has(scope)) {
+        scopeBatchStates.set(scope, []);
+      }
 
-      if (reachedRemoteEnd) {
+      scopeBatchStates.get(scope).push({
+        sourcePage: task.sourcePage,
+        totalPages: simplifiedResponse.total_pages ?? 0,
+        resultsLength: simplifiedResponse.results?.length ?? 0,
+      });
+    }
+
+    for (const [scope, taskStates] of scopeBatchStates.entries()) {
+      const maxScheduledPage = Math.max(...taskStates.map((state) => state.sourcePage));
+      const hasAnyResults = taskStates.some((state) => state.resultsLength > 0);
+      const knownTotalPages = Math.max(...taskStates.map((state) => state.totalPages));
+      const nextPage = maxScheduledPage + 1;
+
+      if (knownTotalPages > 0 && nextPage > knownTotalPages) {
         scope.exhausted = true;
         continue;
       }
 
-      scope.nextPage += 1;
+      if (!hasAnyResults && knownTotalPages === 0) {
+        scope.exhausted = true;
+        continue;
+      }
+
+      scope.nextPage = nextPage;
     }
 
     if (collected.length >= neededCollectedCount) {
@@ -3589,6 +3664,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       selectedScopes: buildSelectedScopes(params.categoryId, sourceMediaTypes, 1),
       neededCollectedCount: rescueNeededCount,
       maxRounds: rescueMaxRounds,
+      allowTraditionalSupplement: false,
     });
   }
 
