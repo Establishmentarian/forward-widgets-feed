@@ -439,7 +439,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.9",
+  version: "0.5.10",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -3648,9 +3648,11 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   // 只保留中文标题后，某些分类前几页的命中密度会明显下降。
   // 若快路径连当前页起点都凑不齐，就退回到从第 1 页补救重扫，避免用户只能翻到一页。
   const rescueNeededCount = ((params.page - 1) * params.count) + params.count;
+  // 稀疏中文分类下，极端情况可能一整页源结果里只有 1 条可用中文标题。
+  // 补救扫描按“至少 1 条 / 源页”来预估上限，避免用户往下翻几页就提前空掉。
   const rescueMaxRounds = Math.max(
     fetchPlan.maxRounds,
-    Math.ceil(rescueNeededCount / 2),
+    rescueNeededCount,
   );
 
   if (
