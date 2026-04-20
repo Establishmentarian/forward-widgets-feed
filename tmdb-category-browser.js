@@ -465,7 +465,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.13",
+  version: "0.5.14",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -2764,17 +2764,18 @@ function getRemotePaginationPlan(params) {
   return {
     sourceStartPage,
     localSkip: 0,
+    requestedSourcePages,
     neededCollectedCount: params.count,
-    maxRounds: requestedSourcePages + CATALOG_SOURCE_FETCH_CONCURRENCY,
   };
 }
 
-function buildSelectedScopes(categoryId, sourceMediaTypes, startPage) {
+function buildSelectedScopes(categoryId, sourceMediaTypes, startPage, requestedSourcePages) {
   return sourceMediaTypes
     .map((mediaType) => ({
       mediaType,
       rule: getRuleById(mediaType, categoryId),
       nextPage: startPage,
+      pagesRemaining: requestedSourcePages,
       totalPages: 0,
       exhausted: false,
     }))
@@ -2793,6 +2794,10 @@ function buildSourcePageBatch(selectedScopes, batchSize) {
       const nextPage = nextPages.get(scope);
 
       if (!Number.isFinite(nextPage)) {
+        continue;
+      }
+
+      if (scope.pagesRemaining <= 0) {
         continue;
       }
 
@@ -2831,16 +2836,15 @@ function resolveCatalogDisplayTitle(record) {
     return traditionalTitle;
   }
 
-  const originalTitle = normalizeTitle(record?.originalTitle);
-  if (originalTitle && containsHan(originalTitle)) {
-    return originalTitle;
-  }
-
   return '';
 }
 
 function hasLocalizedChineseCatalogTitle(record) {
   return Boolean(resolveCatalogDisplayTitle(record));
+}
+
+function collectLocalizedCatalogRecords(records) {
+  return records.filter((record) => hasLocalizedChineseCatalogTitle(record));
 }
 
 function collectCatalogCandidateRecords(records, mediaType, rule, categoryId, sortKey, todayDate) {
@@ -2852,17 +2856,6 @@ function collectCatalogCandidateRecords(records, mediaType, rule, categoryId, so
     const matchedRule = classifyMediaRecord(mediaType, record);
     return Boolean(matchedRule && matchedRule.id === rule.id);
   });
-}
-
-function shouldSupplementCatalogTraditionalPage(candidateRecords, collectedCount, neededCollectedCount) {
-  if (!candidateRecords.length) {
-    return false;
-  }
-
-  const readyCount = candidateRecords.filter((record) => hasLocalizedChineseCatalogTitle(record)).length;
-  const missingCount = candidateRecords.length - readyCount;
-
-  return missingCount > 0 && (collectedCount + readyCount) < neededCollectedCount;
 }
 
 function collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected) {
@@ -2889,20 +2882,13 @@ async function collectCatalogRecords({
   runtime,
   todayDate,
   selectedScopes,
-  neededCollectedCount,
-  maxRounds,
-  allowTraditionalSupplement = true,
   sourceFetchConcurrency = CATALOG_SOURCE_FETCH_CONCURRENCY,
 }) {
   const collected = [];
   const seenRecordKeys = new Set();
-  let fetchedSourcePages = 0;
-
-  while (selectedScopes.some((scope) => !scope.exhausted) && fetchedSourcePages < maxRounds) {
-    const isFirstBatch = fetchedSourcePages === 0;
-    const batchSize = isFirstBatch
-      ? Math.min(sourceFetchConcurrency, selectedScopes.filter((scope) => !scope.exhausted).length)
-      : Math.min(sourceFetchConcurrency, maxRounds - fetchedSourcePages);
+  
+  while (selectedScopes.some((scope) => !scope.exhausted)) {
+    const batchSize = Math.min(sourceFetchConcurrency, selectedScopes.filter((scope) => !scope.exhausted).length);
     const batchTasks = buildSourcePageBatch(
       selectedScopes,
       batchSize,
@@ -2912,63 +2898,51 @@ async function collectCatalogRecords({
       break;
     }
 
-    fetchedSourcePages += batchTasks.length;
-    const simplifiedResponses = await Promise.all(
-      batchTasks.map(({ scope, sourcePage }) =>
-        fetchCatalogSimplifiedPage({
-          mediaType: scope.mediaType,
-          categoryId: params.categoryId,
-          rule: scope.rule,
-          sortKey: params.sortKey,
-          sourcePage,
-          runtime,
-          todayDate,
-        }),
+    const [simplifiedResponses, traditionalResponses] = await Promise.all([
+      Promise.all(
+        batchTasks.map(({ scope, sourcePage }) =>
+          fetchCatalogSimplifiedPage({
+            mediaType: scope.mediaType,
+            categoryId: params.categoryId,
+            rule: scope.rule,
+            sortKey: params.sortKey,
+            sourcePage,
+            runtime,
+            todayDate,
+          }),
+        ),
       ),
-    );
+      Promise.all(
+        batchTasks.map(({ scope, sourcePage }) =>
+          fetchCatalogTraditionalPage({
+            mediaType: scope.mediaType,
+            categoryId: params.categoryId,
+            rule: scope.rule,
+            sortKey: params.sortKey,
+            sourcePage,
+            runtime,
+            todayDate,
+          }),
+        ),
+      ),
+    ]);
     const scopeBatchStates = new Map();
 
     for (const [index, task] of batchTasks.entries()) {
       const simplifiedResponse = simplifiedResponses[index] ?? {};
+      const traditionalResponse = traditionalResponses[index] ?? {};
       const scope = task.scope;
       scope.totalPages = Math.max(scope.totalPages ?? 0, simplifiedResponse.total_pages ?? 0);
-
-      let mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, {});
-      let candidateRecords = collectCatalogCandidateRecords(
-        mergedPage.results,
+      const mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, traditionalResponse);
+      const localizedRecords = collectLocalizedCatalogRecords(mergedPage.results);
+      const candidateRecords = collectCatalogCandidateRecords(
+        localizedRecords,
         scope.mediaType,
         scope.rule,
         params.categoryId,
         params.sortKey,
         todayDate,
       );
-
-      // 当前批次内只对“真正会落入当前分类”的候选页按需补抓 zh-TW。
-      // 补救扫描阶段会关闭这条路径，只跑 zh-CN。
-      if (
-        allowTraditionalSupplement
-        && shouldSupplementCatalogTraditionalPage(candidateRecords, collected.length, neededCollectedCount)
-      ) {
-        const traditionalResponse = await fetchCatalogTraditionalPage({
-          mediaType: scope.mediaType,
-          categoryId: params.categoryId,
-          rule: scope.rule,
-          sortKey: params.sortKey,
-          sourcePage: task.sourcePage,
-          runtime,
-          todayDate,
-        });
-
-        mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, traditionalResponse ?? {});
-        candidateRecords = collectCatalogCandidateRecords(
-          mergedPage.results,
-          scope.mediaType,
-          scope.rule,
-          params.categoryId,
-          params.sortKey,
-          todayDate,
-        );
-      }
 
       collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected);
 
@@ -2999,11 +2973,13 @@ async function collectCatalogRecords({
         continue;
       }
 
-      scope.nextPage = nextPage;
-    }
+      scope.pagesRemaining = Math.max(0, scope.pagesRemaining - taskStates.length);
+      if (scope.pagesRemaining <= 0) {
+        scope.exhausted = true;
+        continue;
+      }
 
-    if (collected.length >= neededCollectedCount) {
-      break;
+      scope.nextPage = nextPage;
     }
   }
 
@@ -3681,6 +3657,7 @@ async function browseCatalogDirect(rawParams = {}, overrides = {}) {
     params.categoryId,
     sourceMediaTypes,
     fetchPlan.sourceStartPage,
+    fetchPlan.requestedSourcePages,
   );
 
   if (!selectedScopes.length) {
@@ -3692,8 +3669,6 @@ async function browseCatalogDirect(rawParams = {}, overrides = {}) {
     runtime,
     todayDate,
     selectedScopes,
-    neededCollectedCount: fetchPlan.neededCollectedCount,
-    maxRounds: fetchPlan.maxRounds,
   });
 
   const sorted = sortCatalogRecords(collected, params.sortKey);
