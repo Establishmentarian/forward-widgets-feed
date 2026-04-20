@@ -43,6 +43,7 @@ const TMDB_WEB_BASE = 'https://www.themoviedb.org';
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const TMDB_LANGUAGE_SIMPLIFIED = 'zh-CN';
 const TMDB_LANGUAGE_TRADITIONAL = 'zh-TW';
+const CATALOG_PROXY_URL = 'https://forward-translation-proxy-worker.laukongnam.workers.dev/catalog';
 const DEFAULT_FALLBACK_TRANSLATION_CONFIG = Object.freeze({
   baseUrl: 'https://api.siliconflow.cn/v1',
   token: 'sk-bnigjvsvbljezknsbskumtnpryzprtphnvirtcdvignussin',
@@ -464,7 +465,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.12",
+  version: "0.5.13",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -3628,7 +3629,49 @@ function normalizeBrowseParams(params = {}) {
   };
 }
 
-async function browseCatalog(rawParams = {}, overrides = {}) {
+function shouldUseCatalogProxy(overrides = {}) {
+  if (overrides.disableCatalogProxy === true) {
+    return false;
+  }
+
+  if (overrides.forceCatalogProxy === true) {
+    return true;
+  }
+
+  return !overrides.tmdbGet;
+}
+
+async function requestCatalogProxyItems(rawParams, overrides = {}) {
+  const httpPost = overrides.httpPost ?? getDefaultHttpPost();
+  const normalizedParams = normalizeBrowseParams(rawParams);
+  const response = await httpPost(
+    CATALOG_PROXY_URL,
+    {
+      category: normalizedParams.categoryId,
+      sort_by: normalizedParams.sortKey,
+      count: String(normalizedParams.count),
+      page: String(normalizedParams.page),
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      timeoutMs: 15 * 1000,
+    },
+  );
+
+  if (Array.isArray(response?.items)) {
+    return response.items;
+  }
+
+  if (Array.isArray(response)) {
+    return response;
+  }
+
+  throw new Error('目录代理返回格式异常');
+}
+
+async function browseCatalogDirect(rawParams = {}, overrides = {}) {
   const params = normalizeBrowseParams(rawParams);
   const runtime = createRuntime(rawParams, overrides);
   const todayDate = getTodayDateString();
@@ -3661,6 +3704,18 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
 
   await flushQueuedCacheWrites(runtime);
   return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
+}
+
+async function browseCatalog(rawParams = {}, overrides = {}) {
+  if (shouldUseCatalogProxy(overrides)) {
+    try {
+      return await requestCatalogProxyItems(rawParams, overrides);
+    } catch {
+      // 代理不可用时退回本地直连逻辑，避免分类墙彻底失效。
+    }
+  }
+
+  return browseCatalogDirect(rawParams, overrides);
 }
 
 async function loadCatalogDetail(link, overrides = {}) {
