@@ -439,7 +439,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.10",
+  version: "0.5.11",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -2735,28 +2735,15 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
   return true;
 }
 
-const LOCALIZED_TITLE_PAGINATION_BACKTRACK_PAGES = 2;
-const LOCALIZED_TITLE_PAGINATION_BACKTRACK_MAX_PAGE = 3;
-
 function getRemotePaginationPlan(params) {
-  const offset = (params.page - 1) * params.count;
-  const estimatedSourceStartPage = Math.floor(offset / TMDB_PAGE_SIZE) + 1;
-  const backtrackPages = params.page <= LOCALIZED_TITLE_PAGINATION_BACKTRACK_MAX_PAGE
-    ? Math.min(
-      Math.max(params.page - 1, 0),
-      LOCALIZED_TITLE_PAGINATION_BACKTRACK_PAGES,
-    )
-    : 0;
-  const sourceStartPage = Math.max(1, estimatedSourceStartPage - backtrackPages);
-  const estimatedItemsBeforeWindow = (sourceStartPage - 1) * TMDB_PAGE_SIZE;
-  const localSkip = Math.max(0, offset - estimatedItemsBeforeWindow);
   const requestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
+  const sourceStartPage = ((params.page - 1) * requestedSourcePages) + 1;
 
   return {
     sourceStartPage,
-    localSkip,
-    neededCollectedCount: localSkip + params.count,
-    maxRounds: requestedSourcePages + PAGINATION_FORWARD_FILL_LIMIT_PAGES + backtrackPages,
+    localSkip: 0,
+    neededCollectedCount: params.count,
+    maxRounds: requestedSourcePages + CATALOG_SOURCE_FETCH_CONCURRENCY,
   };
 }
 
@@ -3644,31 +3631,6 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     neededCollectedCount: fetchPlan.neededCollectedCount,
     maxRounds: fetchPlan.maxRounds,
   });
-
-  // 只保留中文标题后，某些分类前几页的命中密度会明显下降。
-  // 若快路径连当前页起点都凑不齐，就退回到从第 1 页补救重扫，避免用户只能翻到一页。
-  const rescueNeededCount = ((params.page - 1) * params.count) + params.count;
-  // 稀疏中文分类下，极端情况可能一整页源结果里只有 1 条可用中文标题。
-  // 补救扫描按“至少 1 条 / 源页”来预估上限，避免用户往下翻几页就提前空掉。
-  const rescueMaxRounds = Math.max(
-    fetchPlan.maxRounds,
-    rescueNeededCount,
-  );
-
-  if (
-    collected.length < fetchPlan.neededCollectedCount
-    && (fetchPlan.sourceStartPage > 1 || rescueMaxRounds > fetchPlan.maxRounds)
-  ) {
-    collected = await collectCatalogRecords({
-      params,
-      runtime,
-      todayDate,
-      selectedScopes: buildSelectedScopes(params.categoryId, sourceMediaTypes, 1),
-      neededCollectedCount: rescueNeededCount,
-      maxRounds: rescueMaxRounds,
-      allowTraditionalSupplement: false,
-    });
-  }
 
   const sorted = sortCatalogRecords(collected, params.sortKey);
   const startIndex = fetchPlan.localSkip;
