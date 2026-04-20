@@ -162,6 +162,25 @@ const NORMALIZED_GROUPS = Object.freeze({
     'tl',
     'fil',
   ]),
+  movieWesternLanguages: Object.freeze([
+    'en',
+    'fr',
+    'de',
+    'es',
+    'it',
+    'nl',
+    'pt',
+    'ru',
+    'sv',
+    'no',
+    'da',
+    'fi',
+    'pl',
+    'cs',
+    'hu',
+    'ro',
+    'el',
+  ]),
   tvChineseCountries: Object.freeze(['CN', 'TW', 'HK', 'MO']),
   tvAsiaPacificCountries: Object.freeze([
     'JP',
@@ -248,6 +267,9 @@ const MOVIE_RULES = Object.freeze([
     id: 'western_movie',
     title: '西方电影',
     catchAll: true,
+    discover: {
+      originalLanguages: NORMALIZED_GROUPS.movieWesternLanguages,
+    },
     match: {},
   },
 ]);
@@ -300,6 +322,9 @@ const TV_RULES = Object.freeze([
     id: 'western_series',
     title: '西方剧集',
     catchAll: true,
+    discover: {
+      originCountries: NORMALIZED_GROUPS.tvWesternCountries,
+    },
     match: {},
   },
 ]);
@@ -439,7 +464,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.11",
+  version: "0.5.12",
   requiredVersion: '0.0.1',
   author: 'Codex',
   globalParams: GLOBAL_PARAM_OPTIONS,
@@ -1317,11 +1342,7 @@ function matchesRule(record, rule) {
 }
 
 function buildRuleDiscoverParams(rule) {
-  if (rule.catchAll) {
-    return {};
-  }
-
-  const discover = rule.discover ?? (rule.keywordOnly ? {} : rule.match);
+  const discover = rule.discover ?? (rule.catchAll || rule.keywordOnly ? {} : rule.match);
   const params = {};
 
   if (discover.genreIds?.length) {
