@@ -18,22 +18,6 @@ const DEFAULT_PAGE = 1;
 const MAX_COUNT = 60;
 const TMDB_PAGE_SIZE = 20;
 
-// 分类墙现在只做 TMDb 直连窗口分页。
-// 对条目稀疏的大类，单个 Forward 页绑定更多远端页，避免过早翻空。
-const CATALOG_SOURCE_PAGE_MULTIPLIERS = Object.freeze({
-  chinese_movie: 1,
-  chinese_series: 1,
-  animation_movie: 1,
-  animation_series: 1,
-  asia_pacific_movie: 2,
-  asia_pacific_series: 2,
-  western_movie: 4,
-  western_series: 4,
-  documentary: 3,
-  concert: 3,
-  variety: 1,
-});
-
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
@@ -400,15 +384,11 @@ function getDefaultSort() {
   return SORT_KEYS.DATE_DESC;
 }
 
-function getCatalogSourcePageMultiplier(categoryId) {
-  return CATALOG_SOURCE_PAGE_MULTIPLIERS[categoryId] ?? 1;
-}
-
 var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.0",
+  version: "0.6.1",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -1012,8 +992,9 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
 }
 
 function getRemotePaginationPlan(params) {
-  const baseRequestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
-  const requestedSourcePages = baseRequestedSourcePages * getCatalogSourcePageMultiplier(params.categoryId);
+  // 所有分类统一按同一套窗口分页规则处理：
+  // 当前 Forward 页只映射当前所需的远端页数，不再给西方/纪录片/演唱会额外放大倍率。
+  const requestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
   const sourceStartPage = ((params.page - 1) * requestedSourcePages) + 1;
 
   return {
