@@ -17,38 +17,33 @@ const DEFAULT_COUNT = 20;
 const DEFAULT_PAGE = 1;
 const MAX_COUNT = 60;
 const TMDB_PAGE_SIZE = 20;
-const MAX_SOURCE_PAGES = 5;
-const CATALOG_SOURCE_FETCH_CONCURRENCY = 4;
-const PAGINATION_FORWARD_FILL_LIMIT_PAGES = 8;
-const CACHE_MAX_BYTES = 500 * 1024 * 1024;
-const CACHE_NAMESPACE_TMDB = 'cache:tmdb';
-const CACHE_NAMESPACE_TRANSLATE = 'cache:translate';
-const CACHE_MANIFEST_KEY = 'cache:manifest:v1';
-const TMDB_CACHE_TTL_SECONDS = 6 * 60 * 60;
-const TRANSLATION_CACHE_TTL_SECONDS = 180 * 24 * 60 * 60;
-const TRANSLATION_OVERVIEW_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
-const TRANSLATION_FAILURE_CACHE_TTL_SECONDS = 6 * 60 * 60;
-const TRANSLATION_BATCH_SIZE = 4;
-const TRANSLATION_LARGE_BATCH_SIZE = 20;
-const TRANSLATION_HTTP_TIMEOUT_MS = 12 * 1000;
-const TRANSLATION_INTER_BATCH_DELAY_MS = 350;
-const TRANSLATION_MAX_ATTEMPTS = 2;
-const TRANSLATION_PROMPT_VERSION = 'v9';
+
+// 分类墙现在只做 TMDb 直连窗口分页。
+// 对条目稀疏的大类，单个 Forward 页绑定更多远端页，避免过早翻空。
+const CATALOG_SOURCE_PAGE_MULTIPLIERS = Object.freeze({
+  chinese_movie: 1,
+  chinese_series: 1,
+  animation_movie: 1,
+  animation_series: 1,
+  asia_pacific_movie: 2,
+  asia_pacific_series: 2,
+  western_movie: 4,
+  western_series: 4,
+  documentary: 3,
+  concert: 3,
+  variety: 1,
+});
+
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
   strictForeignDate: 3,
 });
-const TMDB_WEB_BASE = 'https://www.themoviedb.org';
+
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const TMDB_LANGUAGE_SIMPLIFIED = 'zh-CN';
 const TMDB_LANGUAGE_TRADITIONAL = 'zh-TW';
-const CATALOG_PROXY_URL = 'https://forward-translation-proxy-worker.laukongnam.workers.dev/catalog';
-const DEFAULT_FALLBACK_TRANSLATION_CONFIG = Object.freeze({
-  baseUrl: 'https://api.siliconflow.cn/v1',
-  token: 'sk-bnigjvsvbljezknsbskumtnpryzprtphnvirtcdvignussin',
-  model: 'Qwen/Qwen2.5-7B-Instruct',
-});
+
 const STRICT_FOREIGN_CATEGORY_IDS = Object.freeze([
   'western_movie',
   'western_series',
@@ -57,66 +52,6 @@ const STRICT_FOREIGN_CATEGORY_IDS = Object.freeze([
   'documentary',
   'concert',
 ]);
-const GLOBAL_PARAM_KEYS = Object.freeze({
-  TRANSLATION_API_BASE_URL: 'translationApiBaseUrl',
-  TRANSLATION_API_TOKEN: 'translationApiToken',
-  TRANSLATION_MODEL: 'translationModel',
-});
-
-const GLOBAL_PARAM_OPTIONS = Object.freeze([
-  {
-    name: GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL,
-    title: '翻译接口 Base URL',
-    type: 'input',
-    value: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
-    description: '默认预填带缓存的翻译 Worker；改成其他 OpenAI 兼容服务时会回退为高级直连模式。',
-    placeholders: [
-      {
-        title: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
-        value: 'https://forward-translation-proxy-worker.laukongnam.workers.dev',
-      },
-      {
-        title: 'https://api.astrocean.space/v1',
-        value: 'https://api.astrocean.space/v1',
-      },
-    ],
-  },
-  {
-    name: GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN,
-    title: '翻译接口 Token',
-    type: 'input',
-    value: '',
-    description: '默认 Worker 模式无需填写；改成外部 OpenAI 兼容服务时再填对应 Token。',
-  },
-  {
-    name: GLOBAL_PARAM_KEYS.TRANSLATION_MODEL,
-    title: '翻译模型名',
-    type: 'input',
-    value: 'Qwen/Qwen2.5-7B-Instruct',
-    description: '默认使用 Worker 的速度优先模型；也可自行改成其他兼容模型。',
-    placeholders: [
-      {
-        title: 'Qwen/Qwen2.5-7B-Instruct',
-        value: 'Qwen/Qwen2.5-7B-Instruct',
-      },
-      {
-        title: 'Qwen/Qwen3.5-4B',
-        value: 'Qwen/Qwen3.5-4B',
-      },
-      {
-        title: 'gpt-5.4-nano',
-        value: 'gpt-5.4-nano',
-      },
-    ],
-  },
-]);
-
-const GLOBAL_PARAM_DEFAULTS = Object.freeze(
-  GLOBAL_PARAM_OPTIONS.reduce((result, option) => {
-    result[option.name] = typeof option.value === 'string' ? option.value : '';
-    return result;
-  }, {}),
-);
 
 const CONCERT_KEYWORDS = Object.freeze([
   '演唱会',
@@ -375,17 +310,21 @@ const CATEGORY_DISPLAY_ORDER = Object.freeze([
 ]);
 
 const MOVIE_CATEGORY_OPTIONS = Object.freeze(
-  MOVIE_CATEGORY_DISPLAY_ORDER.map((ruleId) => MOVIE_RULES.find((rule) => rule.id === ruleId)).map((rule) => ({
-    title: rule.title,
-    value: rule.id,
-  })),
+  MOVIE_CATEGORY_DISPLAY_ORDER
+    .map((ruleId) => MOVIE_RULES.find((rule) => rule.id === ruleId))
+    .map((rule) => ({
+      title: rule.title,
+      value: rule.id,
+    })),
 );
 
 const TV_CATEGORY_OPTIONS = Object.freeze(
-  TV_CATEGORY_DISPLAY_ORDER.map((ruleId) => TV_RULES.find((rule) => rule.id === ruleId)).map((rule) => ({
-    title: rule.title,
-    value: rule.id,
-  })),
+  TV_CATEGORY_DISPLAY_ORDER
+    .map((ruleId) => TV_RULES.find((rule) => rule.id === ruleId))
+    .map((rule) => ({
+      title: rule.title,
+      value: rule.id,
+    })),
 );
 
 const CATEGORY_OPTIONS = Object.freeze(
@@ -461,20 +400,23 @@ function getDefaultSort() {
   return SORT_KEYS.DATE_DESC;
 }
 
+function getCatalogSourcePageMultiplier(categoryId) {
+  return CATALOG_SOURCE_PAGE_MULTIPLIERS[categoryId] ?? 1;
+}
+
 var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
-  description: '基于 TMDb 的剧集与电影分类浏览模块，优先保持原生 TMDb 播放兼容，并对外语分类做中文标题加速。',
-  version: "0.5.14",
+  description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
+  version: "0.6.0",
   requiredVersion: '0.0.1',
   author: 'Codex',
-  globalParams: GLOBAL_PARAM_OPTIONS,
   modules: [
     {
       id: 'tmdb-category-browser',
       type: 'video',
       title: '影视分类',
-      description: '按统一分类和排序浏览 TMDb 影视条目，保持原生 TMDb 播放链路，并尽量优先展示中文标题。',
+      description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
       functionName: 'browseTmdbCategories',
       cacheDuration: 3600,
       params: [
@@ -527,7 +469,7 @@ var WidgetMetadata = {
   ],
 };
 
-// 视频卡片统一走 Forward 原生 TMDb 链路，避免自定义 detail 入口干扰视频源识别。
+// 视频卡片统一走 Forward 原生 TMDb 链路，不再经过 Worker 目录代理或自定义详情封装。
 async function browseTmdbCategories(params) {
   return browseCatalog(params);
 }
@@ -538,87 +480,6 @@ function getDefaultTmdbGet() {
   }
 
   return Widget.tmdb.get.bind(Widget.tmdb);
-}
-
-function getRuntimeGlobal() {
-  // 某些 Forward 宿主环境没有 globalThis，直接引用会在模块初始化阶段抛 ReferenceError。
-  // 这里逐个探测常见全局对象，确保缺计时器时最多降级，不会把整个模块炸掉。
-  if (typeof globalThis !== 'undefined') {
-    return globalThis;
-  }
-
-  if (typeof self !== 'undefined') {
-    return self;
-  }
-
-  if (typeof window !== 'undefined') {
-    return window;
-  }
-
-  if (typeof global !== 'undefined') {
-    return global;
-  }
-
-  return {};
-}
-
-function getTimerFunctions() {
-  const runtimeGlobal = getRuntimeGlobal();
-  const safeSetTimeout =
-    typeof runtimeGlobal.setTimeout === 'function' ? runtimeGlobal.setTimeout.bind(runtimeGlobal) : null;
-  const safeClearTimeout =
-    typeof runtimeGlobal.clearTimeout === 'function' ? runtimeGlobal.clearTimeout.bind(runtimeGlobal) : null;
-
-  return {
-    setTimeout: safeSetTimeout,
-    clearTimeout: safeClearTimeout,
-  };
-}
-
-function getDefaultHttpPost() {
-  if (typeof Widget === 'undefined' || !Widget?.http?.post) {
-    return async () => {
-      throw new Error('当前运行环境缺少 Widget.http.post，无法请求翻译接口。');
-    };
-  }
-
-  return async (url, body, options) => {
-    const { timeoutMs = TRANSLATION_HTTP_TIMEOUT_MS, ...requestOptions } = options ?? {};
-    const requestPromise = Widget.http.post(url, body, requestOptions);
-    const timers = getTimerFunctions();
-
-    let timeoutHandle;
-    try {
-      const response = await (timeoutMs > 0 && timers.setTimeout && timers.clearTimeout
-        ? Promise.race([
-          requestPromise,
-          new Promise((_, reject) => {
-            timeoutHandle = timers.setTimeout(() => {
-              reject(new Error(`翻译请求超时（${timeoutMs}ms）`));
-            }, timeoutMs);
-          }),
-        ])
-        : requestPromise);
-
-      return response?.data ?? response;
-    } finally {
-      if (timeoutHandle && timers.clearTimeout) {
-        timers.clearTimeout(timeoutHandle);
-      }
-    }
-  };
-}
-
-const NOOP_STORAGE = Object.freeze({
-  get: async () => null,
-  set: async () => {},
-  remove: async () => {},
-  keys: async () => [],
-  clear: async () => {},
-});
-
-function getDefaultStorage() {
-  return typeof Widget !== 'undefined' && Widget?.storage ? Widget.storage : NOOP_STORAGE;
 }
 
 function coerceInteger(value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -640,72 +501,26 @@ function buildOrQuery(values) {
   return values.map((value) => String(value)).join('|');
 }
 
-function createObjectFromEntries(entries) {
+function stringifyParams(rawParams = {}) {
   const result = {};
 
-  for (const [key, value] of entries) {
-    result[key] = value;
+  for (const [key, value] of Object.entries(rawParams)) {
+    if (value === undefined || value === null || value === '') {
+      continue;
+    }
+
+    result[key] = String(value);
   }
 
   return result;
 }
 
-function stringifyParams(rawParams) {
-  return createObjectFromEntries(
-    Object.entries(rawParams)
-      .filter(([, value]) => value !== undefined && value !== null && value !== '')
-      .map(([key, value]) => [key, String(value)]),
-  );
+function normalizeTitle(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
-function buildQueryString(rawParams) {
-  return Object.entries(rawParams ?? {})
-    .filter(([, value]) => value !== undefined && value !== null && value !== '')
-    .map(([key, value]) => `${encodeURIComponent(String(key))}=${encodeURIComponent(String(value))}`)
-    .join('&');
-}
-
-function decodeQueryComponent(value) {
-  const normalizedValue = String(value ?? '').replace(/\+/g, '%20');
-
-  try {
-    return decodeURIComponent(normalizedValue);
-  } catch {
-    return normalizedValue;
-  }
-}
-
-function parseQueryString(queryString) {
-  const normalizedQuery = normalizeTitle(queryString).replace(/^\?/, '');
-
-  if (!normalizedQuery) {
-    return {};
-  }
-
-  const result = {};
-
-  for (const segment of normalizedQuery.split('&')) {
-    if (!segment) {
-      continue;
-    }
-
-    const separatorIndex = segment.indexOf('=');
-    const rawKey = separatorIndex === -1 ? segment : segment.slice(0, separatorIndex);
-    const rawValue = separatorIndex === -1 ? '' : segment.slice(separatorIndex + 1);
-    const key = decodeQueryComponent(rawKey);
-
-    if (!key) {
-      continue;
-    }
-
-    result[key] = decodeQueryComponent(rawValue);
-  }
-
-  return result;
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function isMeaningfulText(value) {
+  return normalizeTitle(value).length > 0;
 }
 
 function containsHan(value) {
@@ -716,21 +531,14 @@ function containsNonChineseScript(value) {
   return /[A-Za-z\u3040-\u30ff\uac00-\ud7af]/u.test(value);
 }
 
-function isMeaningfulText(value) {
-  return typeof value === 'string' && value.trim().length > 0;
-}
-
-function normalizeTitle(value) {
-  return isMeaningfulText(value) ? value.trim() : '';
-}
-
-function normalizeUrl(value) {
-  return normalizeTitle(value).replace(/\/+$/, '');
-}
-
 function isUsableTmdbChineseText(value) {
   const normalizedValue = normalizeTitle(value);
   return Boolean(normalizedValue && containsHan(normalizedValue));
+}
+
+function isUsableTmdbChineseTitle(value) {
+  const normalizedValue = normalizeTitle(value);
+  return Boolean(normalizedValue && containsHan(normalizedValue) && !containsNonChineseScript(normalizedValue));
 }
 
 function resolveLocalizedText({ simplifiedText, traditionalText, originalText }) {
@@ -749,275 +557,12 @@ function resolveLocalizedText({ simplifiedText, traditionalText, originalText })
   return simplified || traditional || original;
 }
 
-function sleep(ms) {
-  const timers = getTimerFunctions();
-
-  if (!timers.setTimeout || ms <= 0) {
-    return Promise.resolve();
-  }
-
-  return new Promise((resolve) => timers.setTimeout(resolve, ms));
-}
-
-function chunkArray(array, size) {
-  const chunks = [];
-
-  for (let index = 0; index < array.length; index += size) {
-    chunks.push(array.slice(index, index + size));
-  }
-
-  return chunks;
-}
-
-function buildTranslationSystemPrompt({ strict = false } = {}) {
-  return strict
-    ? '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题统一转换为自然、简体中文片名或剧名。若没有官方中译名，也必须给出常见中文译名或简洁音译，不要保留英文、法文、西语、德语、俄语、韩语罗马字或其他非中文原文。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。'
-    : '你是影视标题翻译器。输入数组中的每一项都包含 title 和 originalTitle，请结合两者把最终卡片标题翻译成自然、简体中文片名或剧名。若 title 只是外文别名，originalTitle 仅用于辅助判断。若没有官方中译名，请给出常见中文译名或简洁音译。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。';
-}
-
-function buildOverviewTranslationSystemPrompt() {
-  return '你是影视简介翻译器。输入数组中的每一项都包含 text 和 contextTitle，请把 text 翻译成自然、简体中文简介。不得扩写、不得总结、不得增加原文没有的信息；contextTitle 仅用于辅助理解，不要把标题重复拼进简介。只输出 JSON，对象中只能包含 translations 数组，顺序必须与输入一致。';
-}
-
-function stableStringify(value) {
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-
-  if (value && typeof value === 'object') {
-    const entries = Object.entries(value).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey));
-    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(',')}}`;
-  }
-
-  return JSON.stringify(value);
-}
-
-function hashString(value) {
-  let hash = 0x811c9dc5;
-
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
-function estimateStringBytes(value) {
-  if (typeof TextEncoder !== 'undefined') {
-    return new TextEncoder().encode(value).length;
-  }
-
-  if (typeof Buffer !== 'undefined') {
-    return Buffer.byteLength(value, 'utf8');
-  }
-
-  return value.length * 2;
-}
-
-function buildCacheStorageKey(namespace, payload) {
-  return `${namespace}:${hashString(stableStringify(payload))}`;
-}
-
-function buildOpenAiChatCompletionsUrl(baseUrl) {
-  const normalized = normalizeUrl(baseUrl);
-  return normalized.endsWith('/chat/completions') ? normalized : `${normalized}/chat/completions`;
-}
-
-function looksLikeTranslationProxyBaseUrl(baseUrl) {
-  const normalized = normalizeUrl(baseUrl);
-
-  if (!normalized) {
-    return false;
-  }
-
-  try {
-    const url = new URL(normalized);
-    const normalizedPath = url.pathname.replace(/\/+$/, '');
-    const hostLooksLikeWorker = url.hostname.endsWith('.workers.dev') || url.hostname.includes('translation-proxy');
-    const pathLooksLikeProxy = !normalizedPath || normalizedPath === '/' || normalizedPath.includes('translation-proxy');
-    const looksLikeOpenAiEndpoint = normalizedPath.endsWith('/v1') || normalizedPath.endsWith('/chat/completions');
-
-    return (hostLooksLikeWorker || pathLooksLikeProxy) && !looksLikeOpenAiEndpoint;
-  } catch {
-    return normalized.includes('translation-proxy');
-  }
-}
-
-function modelSupportsThinkingToggle(model) {
-  const normalized = normalizeTitle(model).toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-
-  return normalized.includes('deepseek-r1') || normalized.includes('qwq');
-}
-
-function parseJsonSafely(value) {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
-
-function getContentJsonCandidate(content) {
-  const objectStart = content.indexOf('{');
-  const objectEnd = content.lastIndexOf('}');
-
-  if (objectStart !== -1 && objectEnd !== -1 && objectEnd > objectStart) {
-    return content.slice(objectStart, objectEnd + 1);
-  }
-
-  const arrayStart = content.indexOf('[');
-  const arrayEnd = content.lastIndexOf(']');
-
-  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
-    return content.slice(arrayStart, arrayEnd + 1);
-  }
-
-  return '';
-}
-
-function normalizeParsedTranslationValue(value) {
-  if (typeof value === 'string') {
-    return normalizeTitle(value);
-  }
-
-  if (!value || typeof value !== 'object') {
-    return '';
-  }
-
-  const candidates = [
-    value.translation,
-    value.translatedTitle,
-    value.title,
-    value.name,
-    value.text,
-    value.result,
-  ];
-
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeTitle(candidate);
-    if (normalizedCandidate) {
-      return normalizedCandidate;
-    }
-  }
-
-  return '';
-}
-
-function parseTranslationResponseContent(content, expectedCount) {
-  if (!isMeaningfulText(content)) {
-    return [];
-  }
-
-  const directParsed = parseJsonSafely(content);
-  if (Array.isArray(directParsed)) {
-    return directParsed.map((value) => normalizeParsedTranslationValue(value)).slice(0, expectedCount);
-  }
-
-  if (Array.isArray(directParsed?.translations)) {
-    return directParsed.translations
-      .map((value) => normalizeParsedTranslationValue(value))
-      .slice(0, expectedCount);
-  }
-
-  const candidate = getContentJsonCandidate(content);
-  const nestedParsed = candidate ? parseJsonSafely(candidate) : null;
-
-  if (Array.isArray(nestedParsed)) {
-    return nestedParsed.map((value) => normalizeParsedTranslationValue(value)).slice(0, expectedCount);
-  }
-
-  if (Array.isArray(nestedParsed?.translations)) {
-    return nestedParsed.translations
-      .map((value) => normalizeParsedTranslationValue(value))
-      .slice(0, expectedCount);
-  }
-
-  return content
-    .split(/\n+/)
-    .map((line) => line.replace(/^\s*(?:[-*]|\d+[.)]|["'])\s*/, '').replace(/\s*["',，。]+\s*$/, ''))
-    .map((line) => normalizeTitle(line))
-    .filter(Boolean)
-    .slice(0, expectedCount);
-}
-
-function shouldPersistTranslatedTitle(originalTitle, translatedTitle) {
-  if (!isMeaningfulText(translatedTitle)) {
-    return false;
-  }
-
-  const normalizedOriginalTitle = normalizeTitle(originalTitle);
-  const normalizedTranslatedTitle = normalizeTitle(translatedTitle);
-
-  if (!normalizedOriginalTitle) {
-    return false;
-  }
-
-  // 对明显外文原名，如果模型只是原样回传，不能把失败结果长期缓存住。
-  if (
-    normalizedTranslatedTitle === normalizedOriginalTitle
-    && (!containsHan(normalizedOriginalTitle) || containsNonChineseScript(normalizedOriginalTitle))
-  ) {
-    return false;
-  }
-
-  if (
-    (!containsHan(normalizedOriginalTitle) || containsNonChineseScript(normalizedOriginalTitle))
-    && !containsHan(normalizedTranslatedTitle)
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function shouldPersistTranslatedOverview(originalText, translatedText) {
-  if (!isMeaningfulText(translatedText)) {
-    return false;
-  }
-
-  const normalizedOriginalText = normalizeTitle(originalText);
-  const normalizedTranslatedText = normalizeTitle(translatedText);
-
-  if (!normalizedOriginalText) {
-    return false;
-  }
-
-  if (
-    normalizedTranslatedText === normalizedOriginalText
-    && (!containsHan(normalizedOriginalText) || containsNonChineseScript(normalizedOriginalText))
-  ) {
-    return false;
-  }
-
-  if (
-    (!containsHan(normalizedOriginalText) || containsNonChineseScript(normalizedOriginalText))
-    && !containsHan(normalizedTranslatedText)
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function isRetryableTranslationError(error) {
-  const message = normalizeTitle(error?.message ?? String(error ?? ''));
-  if (!message) {
-    return false;
-  }
-
-  return /(?:429|502|503|504|busy|timeout|timed out|超时|暂时|稍后|频繁)/i.test(message);
-}
-
-function getTodayDateString() {
-  const now = new Date();
-  const year = String(now.getFullYear());
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle }) {
+  return resolveLocalizedText({
+    simplifiedText: simplifiedTitle,
+    traditionalText: traditionalTitle,
+    originalText: originalTitle,
+  });
 }
 
 function buildImageUrl(size, path) {
@@ -1025,28 +570,22 @@ function buildImageUrl(size, path) {
 }
 
 function getRawTitle(item, mediaType) {
-  return mediaType === MEDIA_TYPES.MOVIE ? item.title : item.name;
+  return mediaType === MEDIA_TYPES.MOVIE ? item?.title : item?.name;
 }
 
 function getRawOriginalTitle(item, mediaType) {
-  return mediaType === MEDIA_TYPES.MOVIE ? item.original_title : item.original_name;
+  return mediaType === MEDIA_TYPES.MOVIE ? item?.original_title : item?.original_name;
 }
 
 function getRawDate(item, mediaType) {
-  return mediaType === MEDIA_TYPES.MOVIE ? item.release_date : item.first_air_date;
-}
-
-function getRawAdultFlag(item) {
-  return item?.adult === true;
+  return mediaType === MEDIA_TYPES.MOVIE ? item?.release_date : item?.first_air_date;
 }
 
 function collectLocalizedEntries(simplifiedItems = [], traditionalItems = [], keySelector = (item) => item.id) {
   const mergedByKey = new Map();
 
   for (const item of traditionalItems ?? []) {
-    mergedByKey.set(keySelector(item), {
-      traditional: item,
-    });
+    mergedByKey.set(keySelector(item), { traditional: item });
   }
 
   for (const item of simplifiedItems ?? []) {
@@ -1092,7 +631,7 @@ function buildLocalizedRecord({
   },
   originalLanguageSelector = (item) => item?.original_language ?? '',
   originCountrySelector = (item) => (Array.isArray(item?.origin_country) ? item.origin_country : []),
-  adultSelector = (item) => getRawAdultFlag(item),
+  adultSelector = (item) => item?.adult === true,
   voteCountSelector = (item) => (Number.isFinite(item?.vote_count) ? item.vote_count : 0),
   voteAverageSelector = (item) => (Number.isFinite(item?.vote_average) ? item.vote_average : NaN),
   posterPathSelector = (item) => item?.poster_path,
@@ -1131,8 +670,10 @@ function buildLocalizedRecord({
     traditionalOverview,
     originalOverview,
     genreIds: genreIdsSelector(baseItem),
-    originalLanguage: originalLanguageSelector(baseItem),
-    originCountry: originCountrySelector(baseItem),
+    originalLanguage: normalizeTitle(originalLanguageSelector(baseItem)).toLowerCase(),
+    originCountry: originCountrySelector(baseItem)
+      .map((value) => normalizeTitle(value).toUpperCase())
+      .filter(Boolean),
     releaseDate: normalizeTitle(dateSelector(baseItem)),
     adult: adultSelector(baseItem),
     voteCount: voteCountSelector(baseItem),
@@ -1142,145 +683,22 @@ function buildLocalizedRecord({
   };
 }
 
-function normalizeTranslationConfig(params = {}) {
-  // Forward 在部分场景只透传用户显式填写过的全局参数，
-  // 不会把 metadata 里的默认值一并带进函数参数；这里主动补齐默认值。
-  return {
-    baseUrl: normalizeUrl(
-      params[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL]
-      ?? GLOBAL_PARAM_DEFAULTS[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL],
-    ),
-    token: normalizeTitle(
-      params[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN]
-      ?? GLOBAL_PARAM_DEFAULTS[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN],
-    ),
-    model: normalizeTitle(
-      params[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL]
-      ?? GLOBAL_PARAM_DEFAULTS[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL],
-    ),
-  };
-}
-
-function buildFallbackTranslationConfig() {
-  return {
-    baseUrl: normalizeUrl(DEFAULT_FALLBACK_TRANSLATION_CONFIG.baseUrl),
-    token: normalizeTitle(DEFAULT_FALLBACK_TRANSLATION_CONFIG.token),
-    model: normalizeTitle(DEFAULT_FALLBACK_TRANSLATION_CONFIG.model),
-  };
-}
-
-function hasTranslationConfig(config) {
-  return Boolean(config?.baseUrl && config?.model);
-}
-
-function isSameTranslationConfig(left, right) {
-  return Boolean(
-    normalizeUrl(left?.baseUrl) === normalizeUrl(right?.baseUrl)
-      && normalizeTitle(left?.token) === normalizeTitle(right?.token)
-      && normalizeTitle(left?.model) === normalizeTitle(right?.model),
-  );
-}
-
-function isTranslationProxyMode(config) {
-  // Forward 会把 metadata 的默认 token 一起透传进来；
-  // 当用户把 Base URL 改成 Worker 代理时，不能因为默认 token 还在就误判成 OpenAI 直连。
-  return Boolean(
-    config?.baseUrl
-      && config?.model
-      && (!config?.token || looksLikeTranslationProxyBaseUrl(config.baseUrl)),
-  );
-}
-
-function isUsableTmdbChineseTitle(title) {
-  const normalizedTitle = normalizeTitle(title);
-  return Boolean(normalizedTitle && containsHan(normalizedTitle) && !containsNonChineseScript(normalizedTitle));
-}
-
-function isUsableTranslatedChineseTitle(title) {
-  const normalizedTitle = normalizeTitle(title);
-  return Boolean(normalizedTitle && containsHan(normalizedTitle));
-}
-
-function getMachineTranslationSourceTitle(record) {
-  return normalizeTitle(record.displayTitle)
-    || normalizeTitle(record.simplifiedTitle)
-    || normalizeTitle(record.traditionalTitle)
-    || normalizeTitle(record.originalTitle);
-}
-
-function buildTranslationJob(record) {
-  const title = getMachineTranslationSourceTitle(record);
-  const originalTitle = normalizeTitle(record.originalTitle) || title;
-
-  return {
-    fieldKind: 'title',
-    tmdbId: record.tmdbId,
-    mediaType: record.mediaType,
-    title,
-    originalTitle,
-    jobKey: stableStringify({
-      fieldKind: 'title',
-      tmdbId: record.tmdbId,
-      mediaType: record.mediaType,
-      title,
-      originalTitle,
-    }),
-  };
-}
-
-function buildOverviewTranslationJob(entry) {
-  const text = normalizeTitle(entry.overview)
-    || normalizeTitle(entry.simplifiedOverview)
-    || normalizeTitle(entry.traditionalOverview)
-    || normalizeTitle(entry.originalOverview);
-  const contextTitle = normalizeTitle(entry.displayTitle) || normalizeTitle(entry.originalTitle);
-
-  return {
-    fieldKind: 'overview',
-    text,
-    contextTitle,
-    jobKey: stableStringify({
-      fieldKind: 'overview',
-      text,
-      contextTitle,
-    }),
-  };
-}
-
-function shouldAttemptMachineTranslation(record) {
-  if (isUsableTmdbChineseTitle(record.simplifiedTitle) || isUsableTmdbChineseTitle(record.traditionalTitle)) {
-    return false;
+function resolveCatalogDisplayTitle(record) {
+  const simplifiedTitle = normalizeTitle(record?.simplifiedTitle);
+  if (isUsableTmdbChineseTitle(simplifiedTitle)) {
+    return simplifiedTitle;
   }
 
-  const translationSourceTitle = getMachineTranslationSourceTitle(record);
-
-  if (!translationSourceTitle) {
-    return false;
+  const traditionalTitle = normalizeTitle(record?.traditionalTitle);
+  if (isUsableTmdbChineseTitle(traditionalTitle)) {
+    return traditionalTitle;
   }
 
-  if (isUsableTmdbChineseTitle(translationSourceTitle)) {
-    return false;
-  }
-
-  return !containsHan(translationSourceTitle) || containsNonChineseScript(translationSourceTitle);
+  return '';
 }
 
-function chooseLocalizedField(primaryItem, secondaryItem, selector) {
-  const primaryValue = selector(primaryItem);
-  if (isMeaningfulText(primaryValue)) {
-    return primaryValue.trim();
-  }
-
-  const secondaryValue = selector(secondaryItem);
-  return isMeaningfulText(secondaryValue) ? secondaryValue.trim() : '';
-}
-
-function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle }) {
-  return resolveLocalizedText({
-    simplifiedText: simplifiedTitle,
-    traditionalText: traditionalTitle,
-    originalText: originalTitle,
-  });
+function hasLocalizedChineseCatalogTitle(record) {
+  return Boolean(resolveCatalogDisplayTitle(record));
 }
 
 function getKeywordCandidates(record) {
@@ -1299,17 +717,21 @@ function getKeywordCandidates(record) {
   );
 }
 
-function matchesKeyword(titleCandidates, keyword) {
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchesKeyword(candidates, keyword) {
   if (/[A-Za-z]/.test(keyword)) {
     const regex = new RegExp(`\\b${escapeRegExp(keyword)}\\b`, 'i');
-    return titleCandidates.some((title) => regex.test(title));
+    return candidates.some((candidate) => regex.test(candidate));
   }
 
-  return titleCandidates.some((title) => title.includes(keyword));
+  return candidates.some((candidate) => candidate.includes(keyword));
 }
 
 function matchesRule(record, rule) {
-  const { match } = rule;
+  const match = rule.match ?? {};
 
   if (match.genreIds?.length) {
     const hasGenre = record.genreIds.some((genreId) => match.genreIds.includes(genreId));
@@ -1318,10 +740,8 @@ function matchesRule(record, rule) {
     }
   }
 
-  if (match.originalLanguages?.length) {
-    if (!match.originalLanguages.includes(record.originalLanguage)) {
-      return false;
-    }
+  if (match.originalLanguages?.length && !match.originalLanguages.includes(record.originalLanguage)) {
+    return false;
   }
 
   if (match.originCountries?.length) {
@@ -1332,14 +752,26 @@ function matchesRule(record, rule) {
   }
 
   if (match.titleKeywords?.length) {
-    const keywordCandidates = getKeywordCandidates(record);
-    const hasKeyword = match.titleKeywords.some((keyword) => matchesKeyword(keywordCandidates, keyword));
+    const candidates = getKeywordCandidates(record);
+    const hasKeyword = match.titleKeywords.some((keyword) => matchesKeyword(candidates, keyword));
     if (!hasKeyword) {
       return false;
     }
   }
 
   return true;
+}
+
+function classifyMediaRecord(mediaType, record) {
+  const rules = getRules(mediaType);
+
+  for (const rule of rules) {
+    if (rule.catchAll || matchesRule(record, rule)) {
+      return rule;
+    }
+  }
+
+  return null;
 }
 
 function buildRuleDiscoverParams(rule) {
@@ -1446,1204 +878,12 @@ function getTmdbSortBy(mediaType, sortKey) {
   }
 }
 
-function mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse) {
-  const records = collectLocalizedEntries(
-    simplifiedResponse.results ?? [],
-    traditionalResponse?.results ?? [],
-    (item) => item.id,
-  )
-    .map(({ key, simplified, traditional }) =>
-      buildLocalizedRecord({
-        tmdbId: key,
-        mediaType,
-        simplifiedItem: simplified,
-        traditionalItem: traditional,
-        titleSelector: (item) => getRawTitle(item, mediaType),
-        originalTitleSelector: (item) => getRawOriginalTitle(item, mediaType),
-      }))
-    .filter(Boolean);
-
-  return {
-    results: records,
-    totalPages: Math.max(simplifiedResponse.total_pages ?? 0, traditionalResponse?.total_pages ?? 0),
-  };
-}
-
-function createCacheState(storage, maxBytes) {
-  return {
-    storage,
-    maxBytes,
-    manifest: null,
-    queue: Promise.resolve(),
-  };
-}
-
-function createRequestMemo() {
-  return {
-    cachedJsonValues: new Map(),
-    tmdbResponses: new Map(),
-    queuedCacheEntries: new Map(),
-    accessedCacheKeys: new Map(),
-  };
-}
-
-function createTranslationPhaseDiagnostic() {
-  return {
-    attempted: false,
-    succeeded: false,
-    reason: null,
-  };
-}
-
-function createTranslationJobDiagnostic() {
-  return {
-    translated: false,
-    finalFailure: false,
-    primary: createTranslationPhaseDiagnostic(),
-    fallback: createTranslationPhaseDiagnostic(),
-  };
-}
-
-function createTranslationDiagnostics() {
-  return {
-    pendingTitleCount: 0,
-    translatedCount: 0,
-    primary: createTranslationPhaseDiagnostic(),
-    fallback: createTranslationPhaseDiagnostic(),
-    jobs: new Map(),
-  };
-}
-
-function normalizeFailureReason(reason) {
-  if ([
-    'timeout',
-    'network',
-    'http_error',
-    'bad_payload',
-    'empty_result',
-    'non_chinese_result',
-  ].includes(reason)) {
-    return reason;
-  }
-
-  return null;
-}
-
-function classifyTranslationFailureReason(error) {
-  const message = normalizeTitle(error?.message ?? String(error ?? ''));
-
-  if (!message) {
-    return 'network';
-  }
-
-  if (/(?:timeout|timed out|超时|abort)/i.test(message)) {
-    return 'timeout';
-  }
-
-  if (/(?:payload|json|parse|解析|格式|translations|数量不匹配|格式异常)/i.test(message)) {
-    return 'bad_payload';
-  }
-
-  if (/(?:empty|为空|空结果)/i.test(message)) {
-    return 'empty_result';
-  }
-
-  if (/(?:network|fetch|econn|socket|dns|连接|联网)/i.test(message)) {
-    return 'network';
-  }
-
-  if (/(?:\b4\d{2}\b|\b5\d{2}\b|http|status|服务)/i.test(message)) {
-    return 'http_error';
-  }
-
-  return 'network';
-}
-
-function getTranslationResultFailureReason(job, translatedTitle) {
-  const normalizedTranslatedTitle = normalizeTitle(translatedTitle);
-
-  if (!normalizedTranslatedTitle) {
-    return 'empty_result';
-  }
-
-  if (!shouldPersistTranslatedTitle(job.title, normalizedTranslatedTitle)) {
-    return 'non_chinese_result';
-  }
-
-  if (!isUsableTranslatedChineseTitle(normalizedTranslatedTitle)) {
-    return 'non_chinese_result';
-  }
-
-  return null;
-}
-
-function ensureTranslationJobDiagnostic(runtime, jobKey) {
-  const diagnostics = runtime.translationDiagnostics;
-
-  if (!diagnostics.jobs.has(jobKey)) {
-    diagnostics.jobs.set(jobKey, createTranslationJobDiagnostic());
-    diagnostics.pendingTitleCount += 1;
-  }
-
-  return diagnostics.jobs.get(jobKey);
-}
-
-function registerTranslationJobs(runtime, jobs) {
-  for (const job of jobs) {
-    if (isMeaningfulText(job?.jobKey)) {
-      ensureTranslationJobDiagnostic(runtime, job.jobKey);
-    }
-  }
-}
-
-function markTranslationPhaseAttempt(runtime, phaseName, jobKey) {
-  const diagnostics = runtime.translationDiagnostics;
-
-  if (diagnostics[phaseName]) {
-    diagnostics[phaseName].attempted = true;
-  }
-
-  if (isMeaningfulText(jobKey)) {
-    ensureTranslationJobDiagnostic(runtime, jobKey)[phaseName].attempted = true;
-  }
-}
-
-function markTranslationPhaseSuccess(runtime, phaseName, jobKey) {
-  const diagnostics = runtime.translationDiagnostics;
-
-  if (diagnostics[phaseName]) {
-    diagnostics[phaseName].attempted = true;
-    diagnostics[phaseName].succeeded = true;
-    diagnostics[phaseName].reason = null;
-  }
-
-  if (isMeaningfulText(jobKey)) {
-    const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
-    jobDiagnostics[phaseName].attempted = true;
-    jobDiagnostics[phaseName].succeeded = true;
-    jobDiagnostics[phaseName].reason = null;
-    jobDiagnostics.translated = true;
-    jobDiagnostics.finalFailure = false;
-  }
-}
-
-function markTranslationPhaseFailure(runtime, phaseName, jobKey, reason) {
-  const normalizedReason = normalizeFailureReason(reason) ?? 'network';
-  const diagnostics = runtime.translationDiagnostics;
-
-  if (diagnostics[phaseName]) {
-    diagnostics[phaseName].attempted = true;
-
-    if (!diagnostics[phaseName].succeeded && !diagnostics[phaseName].reason) {
-      diagnostics[phaseName].reason = normalizedReason;
-    }
-  }
-
-  if (isMeaningfulText(jobKey)) {
-    const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
-    jobDiagnostics[phaseName].attempted = true;
-
-    if (!jobDiagnostics[phaseName].succeeded) {
-      jobDiagnostics[phaseName].reason = normalizedReason;
-    }
-  }
-}
-
-function markTranslationCachedSuccess(runtime, jobKey) {
-  const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
-  jobDiagnostics.translated = true;
-  jobDiagnostics.finalFailure = false;
-}
-
-function markTranslationFinalFailure(runtime, jobKey, diagnostic = {}) {
-  const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
-  const primaryReason = normalizeFailureReason(diagnostic.primaryReason);
-  const fallbackReason = normalizeFailureReason(diagnostic.fallbackReason);
-
-  if (primaryReason) {
-    jobDiagnostics.primary.attempted = true;
-    jobDiagnostics.primary.reason = primaryReason;
-  }
-
-  if (fallbackReason) {
-    jobDiagnostics.fallback.attempted = true;
-    jobDiagnostics.fallback.reason = fallbackReason;
-  }
-
-  if (!jobDiagnostics.translated) {
-    jobDiagnostics.finalFailure = true;
-  }
-}
-
-function buildTranslationFailureDiagnostic(runtime, jobKey) {
-  const jobDiagnostics = ensureTranslationJobDiagnostic(runtime, jobKey);
-
-  return {
-    primaryReason: normalizeFailureReason(jobDiagnostics.primary.reason),
-    fallbackReason: normalizeFailureReason(jobDiagnostics.fallback.reason),
-  };
-}
-
-function finalizeTranslationDiagnostics(runtime) {
-  runtime.translationDiagnostics.translatedCount = Array.from(runtime.translationDiagnostics.jobs.values())
-    .filter((jobDiagnostics) => jobDiagnostics.translated)
-    .length;
-}
-
-function formatTranslationFailureReason(reason) {
-  switch (reason) {
-    case 'timeout':
-      return '超时';
-    case 'network':
-      return '网络';
-    case 'http_error':
-      return '接口';
-    case 'bad_payload':
-      return '返回异常';
-    case 'empty_result':
-      return '空结果';
-    case 'non_chinese_result':
-      return '未转中文';
-    default:
-      return '';
-  }
-}
-
-function buildTranslationFailureNote(jobDiagnostics) {
-  const primaryReasonText = formatTranslationFailureReason(jobDiagnostics?.primary?.reason);
-  const fallbackReasonText = formatTranslationFailureReason(jobDiagnostics?.fallback?.reason);
-
-  if (primaryReasonText || fallbackReasonText) {
-    const fragments = [];
-
-    if (primaryReasonText) {
-      fragments.push(`主:${primaryReasonText}`);
-    }
-
-    if (fallbackReasonText) {
-      fragments.push(`备:${fallbackReasonText}`);
-    }
-
-    return `[翻译] 主代理与备用直连均失败（${fragments.join(' / ')}），已回退原文`;
-  }
-
-  return '[翻译] 主代理与备用直连均失败，已回退原文';
-}
-
-async function withCacheLock(cacheState, operation) {
-  const previous = cacheState.queue;
-  let releaseLock = () => {};
-
-  cacheState.queue = new Promise((resolve) => {
-    releaseLock = resolve;
-  });
-
-  await previous;
-
-  try {
-    return await operation();
-  } finally {
-    releaseLock();
-  }
-}
-
-async function loadCacheManifest(cacheState) {
-  if (cacheState.manifest) {
-    return cacheState.manifest;
-  }
-
-  const rawManifest = await cacheState.storage.get(CACHE_MANIFEST_KEY);
-  const parsed = rawManifest ? parseJsonSafely(rawManifest) : null;
-
-  if (parsed && parsed.entries && typeof parsed.entries === 'object') {
-    cacheState.manifest = parsed;
-    return parsed;
-  }
-
-  cacheState.manifest = {
-    entries: {},
-  };
-
-  return cacheState.manifest;
-}
-
-async function saveCacheManifest(cacheState, manifest) {
-  cacheState.manifest = manifest;
-  await cacheState.storage.set(CACHE_MANIFEST_KEY, JSON.stringify(manifest));
-}
-
-function queueRuntimeCacheWrite(runtime, entry) {
-  if (!runtime?.requestMemo?.queuedCacheEntries || !isMeaningfulText(entry?.cacheKey)) {
-    return;
-  }
-
-  runtime.requestMemo.cachedJsonValues.set(entry.cacheKey, entry.value);
-  runtime.requestMemo.queuedCacheEntries.set(entry.cacheKey, entry);
-}
-
-function markRuntimeCacheAccess(runtime, cacheKey) {
-  if (!runtime?.requestMemo?.accessedCacheKeys || !isMeaningfulText(cacheKey)) {
-    return;
-  }
-
-  runtime.requestMemo.accessedCacheKeys.set(cacheKey, Date.now());
-}
-
-function getManifestTotalBytes(manifest) {
-  return Object.values(manifest.entries).reduce(
-    (sum, entry) => sum + (Number.isFinite(entry?.size) ? entry.size : 0),
-    0,
-  );
-}
-
-async function pruneCache(cacheState, manifest, maxBytes) {
-  const now = Date.now();
-  const expiredKeys = Object.entries(manifest.entries)
-    .filter(([, entry]) => !entry || !Number.isFinite(entry.expiresAt) || entry.expiresAt <= now)
-    .map(([key]) => key);
-
-  for (const key of expiredKeys) {
-    delete manifest.entries[key];
-    await cacheState.storage.remove(key).catch(() => {});
-  }
-
-  let totalBytes = getManifestTotalBytes(manifest);
-  if (totalBytes <= maxBytes) {
-    return;
-  }
-
-  const keysByLastAccess = Object.entries(manifest.entries)
-    .sort(([, left], [, right]) => (left.lastAccess ?? 0) - (right.lastAccess ?? 0))
-    .map(([key]) => key);
-
-  for (const key of keysByLastAccess) {
-    const entry = manifest.entries[key];
-    delete manifest.entries[key];
-    totalBytes -= Number.isFinite(entry?.size) ? entry.size : 0;
-    await cacheState.storage.remove(key).catch(() => {});
-
-    if (totalBytes <= maxBytes) {
-      break;
-    }
-  }
-}
-
-async function removeCachedJsonValue(cacheState, cacheKey) {
-  return withCacheLock(cacheState, async () => {
-    const manifest = await loadCacheManifest(cacheState);
-
-    if (!manifest.entries[cacheKey]) {
-      return;
-    }
-
-    delete manifest.entries[cacheKey];
-    await cacheState.storage.remove(cacheKey).catch(() => {});
-    await saveCacheManifest(cacheState, manifest);
-  });
-}
-
-async function getCachedJsonValue(cacheState, cacheKey) {
-  const manifest = await loadCacheManifest(cacheState);
-  const entry = manifest.entries[cacheKey];
-
-  if (!entry) {
-    return null;
-  }
-
-  const now = Date.now();
-  if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) {
-    await removeCachedJsonValue(cacheState, cacheKey).catch(() => {});
-    return null;
-  }
-
-  const rawValue = await cacheState.storage.get(cacheKey);
-  if (!isMeaningfulText(rawValue)) {
-    await removeCachedJsonValue(cacheState, cacheKey).catch(() => {});
-    return null;
-  }
-
-  return parseJsonSafely(rawValue);
-}
-
-async function getCachedJsonValueFromRuntime(runtime, cacheKey) {
-  if (runtime.requestMemo.cachedJsonValues.has(cacheKey)) {
-    const cachedValue = runtime.requestMemo.cachedJsonValues.get(cacheKey);
-    if (cachedValue) {
-      markRuntimeCacheAccess(runtime, cacheKey);
-    }
-    return cachedValue;
-  }
-
-  const pendingValue = getCachedJsonValue(runtime.cacheState, cacheKey).catch((error) => {
-    runtime.requestMemo.cachedJsonValues.delete(cacheKey);
-    throw error;
-  });
-
-  runtime.requestMemo.cachedJsonValues.set(cacheKey, pendingValue);
-  const resolvedValue = await pendingValue;
-  runtime.requestMemo.cachedJsonValues.set(cacheKey, resolvedValue);
-  if (resolvedValue) {
-    markRuntimeCacheAccess(runtime, cacheKey);
-  }
-  return resolvedValue;
-}
-
-async function setMultipleCachedJsonValues(cacheState, entries, maxBytes, touchedEntries = new Map()) {
-  const queuedEntries = Array.from(
-    new Map(
-      (entries ?? [])
-        .filter((entry) => isMeaningfulText(entry?.cacheKey))
-        .map((entry) => [entry.cacheKey, entry]),
-    ).values(),
-  );
-
-  if (!queuedEntries.length && (!touchedEntries || !touchedEntries.size)) {
-    return;
-  }
-
-  return withCacheLock(cacheState, async () => {
-    const manifest = await loadCacheManifest(cacheState);
-    const now = Date.now();
-
-    for (const [cacheKey, lastAccess] of touchedEntries.entries()) {
-      const entry = manifest.entries[cacheKey];
-      if (entry && Number.isFinite(lastAccess)) {
-        entry.lastAccess = Math.max(entry.lastAccess ?? 0, lastAccess);
-      }
-    }
-
-    const stagedWrites = [];
-
-    for (const entry of queuedEntries) {
-      const rawValue = JSON.stringify(entry.value);
-      const size = estimateStringBytes(entry.cacheKey) + estimateStringBytes(rawValue);
-
-      if (size > maxBytes) {
-        continue;
-      }
-
-      manifest.entries[entry.cacheKey] = {
-        namespace: entry.namespace,
-        size,
-        lastAccess: now,
-        expiresAt: now + entry.ttlSeconds * 1000,
-      };
-
-      stagedWrites.push({
-        cacheKey: entry.cacheKey,
-        rawValue,
-      });
-    }
-
-    await pruneCache(cacheState, manifest, maxBytes);
-    const survivingKeys = new Set(Object.keys(manifest.entries));
-
-    await Promise.allSettled(
-      stagedWrites
-        .filter((entry) => survivingKeys.has(entry.cacheKey))
-        .map((entry) => cacheState.storage.set(entry.cacheKey, entry.rawValue)),
-    );
-
-    await saveCacheManifest(cacheState, manifest);
-  });
-}
-
-async function flushQueuedCacheWrites(runtime) {
-  const queuedEntries = Array.from(runtime.requestMemo.queuedCacheEntries.values());
-
-  if (!queuedEntries.length) {
-    runtime.requestMemo.accessedCacheKeys.clear();
-    return;
-  }
-
-  const touchedEntries = new Map(runtime.requestMemo.accessedCacheKeys);
-  runtime.requestMemo.queuedCacheEntries.clear();
-  runtime.requestMemo.accessedCacheKeys.clear();
-
-  await setMultipleCachedJsonValues(
-    runtime.cacheState,
-    queuedEntries,
-    runtime.cacheMaxBytes,
-    touchedEntries,
-  ).catch(() => {});
-}
-
-async function setCachedJsonValue(cacheState, cacheKey, value, { namespace, ttlSeconds, maxBytes }) {
-  return withCacheLock(cacheState, async () => {
-    const rawValue = JSON.stringify(value);
-    const size = estimateStringBytes(cacheKey) + estimateStringBytes(rawValue);
-
-    if (size > maxBytes) {
-      return;
-    }
-
-    const manifest = await loadCacheManifest(cacheState);
-    const now = Date.now();
-
-    if (manifest.entries[cacheKey]) {
-      delete manifest.entries[cacheKey];
-      await cacheState.storage.remove(cacheKey).catch(() => {});
-    }
-
-    manifest.entries[cacheKey] = {
-      namespace,
-      size,
-      lastAccess: now,
-      expiresAt: now + ttlSeconds * 1000,
-    };
-
-    await pruneCache(cacheState, manifest, Math.max(maxBytes - size, 0));
-    await cacheState.storage.set(cacheKey, rawValue);
-    await saveCacheManifest(cacheState, manifest);
-  });
-}
-
-async function setCachedJsonValueFromRuntime(runtime, cacheKey, value, options) {
-  runtime.requestMemo.cachedJsonValues.set(cacheKey, value);
-  return setCachedJsonValue(runtime.cacheState, cacheKey, value, options);
-}
-
-async function cachedTmdbGet(path, options, runtime) {
-  const cacheKey = buildCacheStorageKey(CACHE_NAMESPACE_TMDB, {
-    path,
-    params: createObjectFromEntries(
-      Object.entries(options?.params ?? {}).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey)),
-    ),
-  });
-
-  if (runtime.requestMemo.tmdbResponses.has(cacheKey)) {
-    return runtime.requestMemo.tmdbResponses.get(cacheKey);
-  }
-
-  const pendingResponse = (async () => {
-    const cachedValue = await getCachedJsonValueFromRuntime(runtime, cacheKey);
-    if (cachedValue) {
-      return cachedValue;
-    }
-
-    const response = await runtime.tmdbGet(path, options);
-
-    queueRuntimeCacheWrite(runtime, {
-      cacheKey,
-      value: response,
-      namespace: CACHE_NAMESPACE_TMDB,
-      ttlSeconds: TMDB_CACHE_TTL_SECONDS,
-    });
-
-    return response;
-  })().catch((error) => {
-    runtime.requestMemo.tmdbResponses.delete(cacheKey);
-    throw error;
-  });
-
-  runtime.requestMemo.tmdbResponses.set(cacheKey, pendingResponse);
-  const resolvedResponse = await pendingResponse;
-  runtime.requestMemo.tmdbResponses.set(cacheKey, resolvedResponse);
-  return resolvedResponse;
-}
-
-function buildTranslationItemsPayload(items) {
-  return items.map((item) => ({
-    tmdbId: item.tmdbId,
-    mediaType: item.mediaType,
-    title: item.title,
-    originalTitle: item.originalTitle,
-  }));
-}
-
-function buildOverviewTranslationItemsPayload(items) {
-  return items.map((item) => ({
-    text: item.text,
-    contextTitle: item.contextTitle,
-  }));
-}
-
-function buildTranslationCacheKey(job, primaryConfig, fallbackConfig) {
-  return buildCacheStorageKey(CACHE_NAMESPACE_TRANSLATE, {
-    fieldKind: job.fieldKind ?? 'title',
-    primaryBaseUrl: primaryConfig?.baseUrl ?? '',
-    primaryModel: primaryConfig?.model ?? '',
-    fallbackBaseUrl: fallbackConfig?.baseUrl ?? '',
-    fallbackModel: fallbackConfig?.model ?? '',
-    promptVersion: TRANSLATION_PROMPT_VERSION,
-    tmdbId: job.tmdbId ?? '',
-    mediaType: job.mediaType ?? '',
-    title: job.tmdbId ? '' : job.title ?? '',
-    originalTitle: job.tmdbId ? '' : job.originalTitle ?? '',
-    text: job.text ?? '',
-    contextTitle: job.contextTitle ?? '',
-  });
-}
-
-function chooseOverviewTranslationConfig(primaryConfig) {
-  if (hasTranslationConfig(primaryConfig) && !isTranslationProxyMode(primaryConfig) && primaryConfig.token) {
-    return primaryConfig;
-  }
-
-  return normalizeTranslationConfig(GLOBAL_PARAM_DEFAULTS);
-}
-
-async function requestTranslationBatch(items, translationConfig, runtime, { strict = false } = {}) {
-  if (!items.length) {
-    return [];
-  }
-
-  if (isTranslationProxyMode(translationConfig)) {
-    const response = await runtime.httpPost(
-      normalizeUrl(translationConfig.baseUrl),
-      {
-        items: buildTranslationItemsPayload(items),
-        model: translationConfig.model,
-        strict,
-        promptVersion: TRANSLATION_PROMPT_VERSION,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
-      },
-    );
-
-    if (Array.isArray(response?.translations)) {
-      const translations = response.translations.map((value) => normalizeTitle(String(value)));
-
-      if (translations.length !== items.length) {
-        throw new Error('翻译代理返回数量不匹配');
-      }
-
-      return translations;
-    }
-
-    throw new Error('翻译代理返回格式异常');
-  }
-
-  const requestBody = {
-    model: translationConfig.model,
-    temperature: 0,
-    max_tokens: 160,
-    response_format: {
-      type: 'json_object',
-    },
-    messages: [
-      {
-        role: 'system',
-        content: buildTranslationSystemPrompt({ strict }),
-      },
-      {
-        role: 'user',
-        content: JSON.stringify({ items: buildTranslationItemsPayload(items) }),
-      },
-    ],
-  };
-
-  if (modelSupportsThinkingToggle(translationConfig.model)) {
-    requestBody.enable_thinking = false;
-  }
-
-  const response = await runtime.httpPost(
-    buildOpenAiChatCompletionsUrl(translationConfig.baseUrl),
-    requestBody,
-    {
-      headers: {
-        Authorization: `Bearer ${translationConfig.token}`,
-      },
-      timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
-    },
-  );
-
-  const content = response?.choices?.[0]?.message?.content ?? '';
-  const parsedTranslations = parseTranslationResponseContent(content, items.length);
-  if (!parsedTranslations.length) {
-    throw new Error('翻译结果为空');
-  }
-
-  if (parsedTranslations.length !== items.length) {
-    throw new Error('翻译结果数量不匹配');
-  }
-
-  return parsedTranslations.map((value) => normalizeTitle(value));
-}
-
-async function requestTranslationBatchWithBackoff(batch, translationConfig, runtime, { strict = false } = {}) {
-  if (!hasTranslationConfig(translationConfig)) {
-    return {
-      translatedBatch: batch.map((item) => item.title),
-      requestSucceeded: false,
-      error: null,
-    };
-  }
-
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return {
-        translatedBatch: await requestTranslationBatch(batch, translationConfig, runtime, { strict }),
-        requestSucceeded: true,
-      };
-    } catch (error) {
-      lastError = error;
-
-      if (attempt >= TRANSLATION_MAX_ATTEMPTS || !isRetryableTranslationError(error)) {
-        break;
-      }
-
-      await sleep(600 * attempt);
-    }
-  }
-
-  return {
-    translatedBatch: batch,
-    requestSucceeded: false,
-    error: lastError,
-  };
-}
-
-async function requestOverviewBatch(items, translationConfig, runtime) {
-  if (!items.length) {
-    return [];
-  }
-
-  const effectiveConfig = chooseOverviewTranslationConfig(translationConfig);
-  if (!hasTranslationConfig(effectiveConfig) || !effectiveConfig.token) {
-    return items.map((item) => item.text);
-  }
-
-  const requestBody = {
-    model: effectiveConfig.model,
-    temperature: 0,
-    max_tokens: 400,
-    response_format: {
-      type: 'json_object',
-    },
-    messages: [
-      {
-        role: 'system',
-        content: buildOverviewTranslationSystemPrompt(),
-      },
-      {
-        role: 'user',
-        content: JSON.stringify({ items: buildOverviewTranslationItemsPayload(items) }),
-      },
-    ],
-  };
-
-  if (modelSupportsThinkingToggle(effectiveConfig.model)) {
-    requestBody.enable_thinking = false;
-  }
-
-  const response = await runtime.httpPost(
-    buildOpenAiChatCompletionsUrl(effectiveConfig.baseUrl),
-    requestBody,
-    {
-      headers: {
-        Authorization: `Bearer ${effectiveConfig.token}`,
-      },
-      timeoutMs: TRANSLATION_HTTP_TIMEOUT_MS,
-    },
-  );
-
-  const content = response?.choices?.[0]?.message?.content ?? '';
-  const parsedTranslations = parseTranslationResponseContent(content, items.length);
-
-  return items.map((item, index) => normalizeTitle(parsedTranslations[index]) || item.text);
-}
-
-async function requestOverviewBatchWithBackoff(batch, translationConfig, runtime) {
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return {
-        translatedBatch: await requestOverviewBatch(batch, translationConfig, runtime),
-        requestSucceeded: true,
-      };
-    } catch (error) {
-      lastError = error;
-
-      if (attempt >= TRANSLATION_MAX_ATTEMPTS || !isRetryableTranslationError(error)) {
-        break;
-      }
-
-      await sleep(600 * attempt);
-    }
-  }
-
-  return {
-    translatedBatch: batch.map((item) => item.text),
-    requestSucceeded: false,
-    error: lastError,
-  };
-}
-
-function collectUntranslatedOverviewEntries(batch, translatedBatch) {
-  return batch
-    .map((item, index) => ({
-      job: item,
-      translatedText: normalizeTitle(translatedBatch[index]) || item.text,
-    }))
-    .filter(({ job, translatedText }) => {
-      const normalizedSource = normalizeTitle(job.text);
-
-      if (!normalizedSource) {
-        return false;
-      }
-
-      if (isUsableTmdbChineseText(translatedText)) {
-        return false;
-      }
-
-      return !containsHan(normalizedSource) || containsNonChineseScript(normalizedSource);
-    });
-}
-
-async function persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle) {
-  queueRuntimeCacheWrite(runtime, {
-    cacheKey,
-    value: { translatedTitle, status: 'success' },
-    namespace: CACHE_NAMESPACE_TRANSLATE,
-    ttlSeconds: TRANSLATION_CACHE_TTL_SECONDS,
-  });
-}
-
-async function persistSuccessfulOverviewTranslation(runtime, cacheKey, translatedText) {
-  queueRuntimeCacheWrite(runtime, {
-    cacheKey,
-    value: { translatedTitle: translatedText, status: 'success' },
-    namespace: CACHE_NAMESPACE_TRANSLATE,
-    ttlSeconds: TRANSLATION_OVERVIEW_CACHE_TTL_SECONDS,
-  });
-}
-
-async function persistFailedTranslation(runtime, cacheKey, diagnostic = null) {
-  queueRuntimeCacheWrite(runtime, {
-    cacheKey,
-    value: { status: 'failed', diagnostic },
-    namespace: CACHE_NAMESPACE_TRANSLATE,
-    ttlSeconds: TRANSLATION_FAILURE_CACHE_TTL_SECONDS,
-  });
-}
-
-async function translateSingleJobWithFallback(
-  job,
-  primaryConfig,
-  runtime,
-  { primaryPhaseName = 'primary', fallbackPhaseName = 'fallback' } = {},
-) {
-  if (hasTranslationConfig(primaryConfig)) {
-    markTranslationPhaseAttempt(runtime, primaryPhaseName, job.jobKey);
-    const primaryResult = await requestTranslationBatchWithBackoff([job], primaryConfig, runtime, { strict: true });
-    const primaryTitle = normalizeTitle(primaryResult.translatedBatch[0]);
-    const primaryReason = primaryResult.requestSucceeded
-      ? getTranslationResultFailureReason(job, primaryTitle)
-      : classifyTranslationFailureReason(primaryResult.error);
-
-    if (!primaryReason) {
-      markTranslationPhaseSuccess(runtime, primaryPhaseName, job.jobKey);
-      return {
-        translatedTitle: primaryTitle,
-        requestSucceeded: true,
-      };
-    }
-
-    markTranslationPhaseFailure(runtime, primaryPhaseName, job.jobKey, primaryReason);
-  }
-
-  if (
-    hasTranslationConfig(runtime.fallbackTranslationConfig)
-    && !isSameTranslationConfig(primaryConfig, runtime.fallbackTranslationConfig)
-  ) {
-    markTranslationPhaseAttempt(runtime, fallbackPhaseName, job.jobKey);
-    const fallbackResult = await requestTranslationBatchWithBackoff(
-      [job],
-      runtime.fallbackTranslationConfig,
-      runtime,
-      { strict: true },
-    );
-    const fallbackTitle = normalizeTitle(fallbackResult.translatedBatch[0]);
-    const fallbackReason = fallbackResult.requestSucceeded
-      ? getTranslationResultFailureReason(job, fallbackTitle)
-      : classifyTranslationFailureReason(fallbackResult.error);
-
-    if (!fallbackReason) {
-      markTranslationPhaseSuccess(runtime, fallbackPhaseName, job.jobKey);
-      return {
-        translatedTitle: fallbackTitle,
-        requestSucceeded: true,
-      };
-    }
-
-    markTranslationPhaseFailure(runtime, fallbackPhaseName, job.jobKey, fallbackReason);
-  }
-
-  return {
-    translatedTitle: '',
-    requestSucceeded: false,
-  };
-}
-
-async function translateJobsByBatches(jobs, translationConfig, runtime, translatedMap, phaseName) {
-  if (!jobs.length || !hasTranslationConfig(translationConfig)) {
-    return [...jobs];
-  }
-
-  const unresolvedJobs = [];
-  const batches = chunkArray(jobs, TRANSLATION_LARGE_BATCH_SIZE);
-
-  for (const [batchIndex, batch] of batches.entries()) {
-    for (const job of batch) {
-      markTranslationPhaseAttempt(runtime, phaseName, job.jobKey);
-    }
-
-    const result = await requestTranslationBatchWithBackoff(batch, translationConfig, runtime);
-
-    if (!result.requestSucceeded) {
-      const failureReason = classifyTranslationFailureReason(result.error);
-
-      for (const job of batch) {
-        markTranslationPhaseFailure(runtime, phaseName, job.jobKey, failureReason);
-        unresolvedJobs.push(job);
-      }
-    } else {
-      for (const [itemIndex, job] of batch.entries()) {
-        const translatedTitle = normalizeTitle(result.translatedBatch[itemIndex]);
-        const failureReason = getTranslationResultFailureReason(job, translatedTitle);
-
-        if (!failureReason) {
-          const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
-          translatedMap.set(job.jobKey, translatedTitle);
-          markTranslationPhaseSuccess(runtime, phaseName, job.jobKey);
-          await persistSuccessfulTitleTranslation(runtime, cacheKey, translatedTitle);
-          continue;
-        }
-
-        markTranslationPhaseFailure(runtime, phaseName, job.jobKey, failureReason);
-        unresolvedJobs.push(job);
-      }
-    }
-
-    if (getTimerFunctions().setTimeout && batchIndex + 1 < batches.length) {
-      await sleep(TRANSLATION_INTER_BATCH_DELAY_MS);
-    }
-  }
-
-  return unresolvedJobs;
-}
-
-async function translateTitlesWithCache(jobs, translationConfig, runtime) {
-  if (!jobs.length) {
-    return new Map();
-  }
-
-  const dedupedJobs = Array.from(
-    new Map(
-      jobs
-        .filter((job) => isMeaningfulText(job?.title))
-        .map((job) => [job.jobKey, job]),
-    ).values(),
-  );
-  const translatedMap = new Map();
-  const missingJobs = [];
-  registerTranslationJobs(runtime, dedupedJobs);
-
-  for (const job of dedupedJobs) {
-    const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
-    const cachedValue = await getCachedJsonValueFromRuntime(runtime, cacheKey);
-
-    if (cachedValue?.translatedTitle) {
-      translatedMap.set(job.jobKey, normalizeTitle(cachedValue.translatedTitle));
-      markTranslationCachedSuccess(runtime, job.jobKey);
-      continue;
-    }
-
-    if (cachedValue?.status === 'failed') {
-      markTranslationFinalFailure(runtime, job.jobKey, cachedValue?.diagnostic);
-      continue;
-    }
-
-    missingJobs.push(job);
-  }
-
-  let unresolvedJobs = [...missingJobs];
-
-  if (unresolvedJobs.length) {
-    unresolvedJobs = await translateJobsByBatches(
-      unresolvedJobs,
-      translationConfig,
-      runtime,
-      translatedMap,
-      'primary',
-    );
-  }
-
-  if (isTranslationProxyMode(translationConfig) && unresolvedJobs.length) {
-    unresolvedJobs = await translateJobsByBatches(
-      unresolvedJobs,
-      runtime.fallbackTranslationConfig,
-      runtime,
-      translatedMap,
-      'fallback',
-    );
-  }
-
-  if (unresolvedJobs.length) {
-    for (const job of unresolvedJobs) {
-      const cacheKey = buildTranslationCacheKey(job, translationConfig, runtime.fallbackTranslationConfig);
-      const singlePrimaryConfig = isTranslationProxyMode(translationConfig)
-        ? runtime.fallbackTranslationConfig
-        : translationConfig;
-      const singleResult = await translateSingleJobWithFallback(
-        job,
-        singlePrimaryConfig,
-        runtime,
-        isTranslationProxyMode(translationConfig)
-          ? { primaryPhaseName: 'fallback', fallbackPhaseName: 'fallback' }
-          : undefined,
-      );
-
-      if (isUsableTranslatedChineseTitle(singleResult.translatedTitle)) {
-        translatedMap.set(job.jobKey, singleResult.translatedTitle);
-        await persistSuccessfulTitleTranslation(runtime, cacheKey, singleResult.translatedTitle);
-        continue;
-      }
-
-      const diagnostic = buildTranslationFailureDiagnostic(runtime, job.jobKey);
-      markTranslationFinalFailure(runtime, job.jobKey, diagnostic);
-      await persistFailedTranslation(runtime, cacheKey, diagnostic);
-    }
-  }
-
-  finalizeTranslationDiagnostics(runtime);
-  return translatedMap;
-}
-
-async function translateOverviewsWithCache(entries, translationConfig, runtime) {
-  if (!entries.length) {
-    return new Map();
-  }
-
-  const dedupedJobs = Array.from(
-    new Map(
-      entries
-        .map((entry) => buildOverviewTranslationJob(entry))
-        .filter((job) => isMeaningfulText(job?.text))
-        .map((job) => [job.jobKey, job]),
-    ).values(),
-  );
-  const translatedMap = new Map();
-  const missingJobs = [];
-  const overviewConfig = chooseOverviewTranslationConfig(translationConfig);
-
-  for (const job of dedupedJobs) {
-    const cacheKey = buildTranslationCacheKey(job, overviewConfig, null);
-    const cachedValue = await getCachedJsonValueFromRuntime(runtime, cacheKey);
-
-    if (cachedValue?.translatedTitle) {
-      translatedMap.set(job.jobKey, normalizeTitle(cachedValue.translatedTitle));
-      continue;
-    }
-
-    if (cachedValue?.status === 'failed') {
-      continue;
-    }
-
-    missingJobs.push(job);
-  }
-
-  for (let index = 0; index < missingJobs.length; index += TRANSLATION_LARGE_BATCH_SIZE) {
-    const batch = missingJobs.slice(index, index + TRANSLATION_LARGE_BATCH_SIZE);
-    const { translatedBatch } = await requestOverviewBatchWithBackoff(batch, overviewConfig, runtime);
-    const unresolvedEntries = collectUntranslatedOverviewEntries(batch, translatedBatch);
-    const unresolvedKeys = new Set(unresolvedEntries.map((entry) => entry.job.jobKey));
-
-    for (const [batchIndex, job] of batch.entries()) {
-      const translatedText = normalizeTitle(translatedBatch[batchIndex]) || job.text;
-      const cacheKey = buildTranslationCacheKey(job, overviewConfig, null);
-
-      if (!unresolvedKeys.has(job.jobKey) && shouldPersistTranslatedOverview(job.text, translatedText)) {
-        translatedMap.set(job.jobKey, translatedText);
-        await persistSuccessfulOverviewTranslation(runtime, cacheKey, translatedText);
-      } else {
-        await persistFailedTranslation(runtime, cacheKey);
-      }
-    }
-  }
-
-  return translatedMap;
-}
-
-async function applyMachineTranslationFallback(records, translationConfig, runtime) {
-  const translationTargets = records.filter((record) => shouldAttemptMachineTranslation(record));
-
-  if (!translationTargets.length) {
-    return records;
-  }
-
-  const translationJobByRecordKey = new Map(
-    translationTargets.map((record) => [`${record.mediaType}:${record.tmdbId}`, buildTranslationJob(record)]),
-  );
-
-  const translatedMap = await translateTitlesWithCache(
-    translationTargets
-      .map((record) => translationJobByRecordKey.get(`${record.mediaType}:${record.tmdbId}`))
-      .filter((job) => isMeaningfulText(job?.title)),
-    translationConfig,
-    runtime,
-  );
-
-  for (const record of translationTargets) {
-    const translationJob = translationJobByRecordKey.get(`${record.mediaType}:${record.tmdbId}`);
-    const translatedTitle = translatedMap.get(translationJob?.jobKey);
-
-    if (isMeaningfulText(translatedTitle)) {
-      record.displayTitle = translatedTitle;
-    }
-  }
-
-  return records;
-}
-
-function shouldAttemptOverviewTranslation(entry) {
-  if (isUsableTmdbChineseText(entry.simplifiedOverview) || isUsableTmdbChineseText(entry.traditionalOverview)) {
-    return false;
-  }
-
-  const sourceText = normalizeTitle(entry.overview)
-    || normalizeTitle(entry.simplifiedOverview)
-    || normalizeTitle(entry.traditionalOverview)
-    || normalizeTitle(entry.originalOverview);
-
-  if (!sourceText) {
-    return false;
-  }
-
-  if (isUsableTmdbChineseText(sourceText) && !containsNonChineseScript(sourceText)) {
-    return false;
-  }
-
-  return !containsHan(sourceText) || containsNonChineseScript(sourceText);
-}
-
-async function applyOverviewTranslationFallback(entries, translationConfig, runtime) {
-  const translationTargets = entries.filter((entry) => shouldAttemptOverviewTranslation(entry));
-
-  if (!translationTargets.length) {
-    return entries;
-  }
-
-  const translatedMap = await translateOverviewsWithCache(translationTargets, translationConfig, runtime);
-
-  for (const entry of translationTargets) {
-    const translationJob = buildOverviewTranslationJob(entry);
-    const translatedOverview = translatedMap.get(translationJob.jobKey);
-
-    if (isMeaningfulText(translatedOverview)) {
-      entry.overview = translatedOverview;
-    }
-  }
-
-  return entries;
+function getTodayDateString() {
+  const now = new Date();
+  const year = String(now.getFullYear());
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate) {
@@ -2666,43 +906,57 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
   return stringifyParams(params);
 }
 
-function createRuntime(rawParams, overrides = {}) {
-  const storage = overrides.storage ?? getDefaultStorage();
-  const cacheMaxBytes = overrides.cacheOptions?.maxBytes ?? CACHE_MAX_BYTES;
+function mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse) {
+  const records = collectLocalizedEntries(
+    simplifiedResponse?.results ?? [],
+    traditionalResponse?.results ?? [],
+    (item) => item.id,
+  )
+    .map(({ key, simplified, traditional }) =>
+      buildLocalizedRecord({
+        tmdbId: key,
+        mediaType,
+        simplifiedItem: simplified,
+        traditionalItem: traditional,
+        titleSelector: (item) => getRawTitle(item, mediaType),
+        originalTitleSelector: (item) => getRawOriginalTitle(item, mediaType),
+      }))
+    .filter(Boolean);
 
   return {
-    tmdbGet: overrides.tmdbGet ?? getDefaultTmdbGet(),
-    httpPost: overrides.httpPost ?? getDefaultHttpPost(),
-    storage,
-    cacheMaxBytes,
-    cacheState: createCacheState(storage, cacheMaxBytes),
-    requestMemo: createRequestMemo(),
-    translationDiagnostics: createTranslationDiagnostics(),
-    translationConfig: normalizeTranslationConfig(rawParams),
-    fallbackTranslationConfig: buildFallbackTranslationConfig(),
+    results: records,
+    totalPages: Math.max(simplifiedResponse?.total_pages ?? 0, traditionalResponse?.total_pages ?? 0),
   };
 }
 
-async function fetchCatalogSimplifiedPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
+async function fetchLocalizedDiscoverPage({
+  mediaType,
+  categoryId,
+  rule,
+  sortKey,
+  sourcePage,
+  tmdbGet,
+  todayDate,
+}) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
   const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
-  return cachedTmdbGet(endpoint, {
-    params: {
-      ...commonParams,
-      language: TMDB_LANGUAGE_SIMPLIFIED,
-    },
-  }, runtime);
-}
 
-async function fetchCatalogTraditionalPage({ mediaType, categoryId, rule, sortKey, sourcePage, runtime, todayDate }) {
-  const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
-  const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
-  return cachedTmdbGet(endpoint, {
-    params: {
-      ...commonParams,
-      language: TMDB_LANGUAGE_TRADITIONAL,
-    },
-  }, runtime);
+  const [simplifiedResponse, traditionalResponse] = await Promise.all([
+    tmdbGet(endpoint, {
+      params: {
+        ...commonParams,
+        language: TMDB_LANGUAGE_SIMPLIFIED,
+      },
+    }),
+    tmdbGet(endpoint, {
+      params: {
+        ...commonParams,
+        language: TMDB_LANGUAGE_TRADITIONAL,
+      },
+    }),
+  ]);
+
+  return mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse);
 }
 
 const EXPLICIT_ADULT_PATTERNS = [
@@ -2758,14 +1012,13 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
 }
 
 function getRemotePaginationPlan(params) {
-  const requestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
+  const baseRequestedSourcePages = Math.max(1, Math.ceil(params.count / TMDB_PAGE_SIZE));
+  const requestedSourcePages = baseRequestedSourcePages * getCatalogSourcePageMultiplier(params.categoryId);
   const sourceStartPage = ((params.page - 1) * requestedSourcePages) + 1;
 
   return {
     sourceStartPage,
-    localSkip: 0,
     requestedSourcePages,
-    neededCollectedCount: params.count,
   };
 }
 
@@ -2774,228 +1027,78 @@ function buildSelectedScopes(categoryId, sourceMediaTypes, startPage, requestedS
     .map((mediaType) => ({
       mediaType,
       rule: getRuleById(mediaType, categoryId),
-      nextPage: startPage,
-      pagesRemaining: requestedSourcePages,
-      totalPages: 0,
-      exhausted: false,
+      startPage,
+      requestedSourcePages,
     }))
     .filter((scope) => scope.rule);
 }
 
-function buildSourcePageBatch(selectedScopes, batchSize) {
-  const activeScopes = selectedScopes.filter((scope) => !scope.exhausted);
-  const nextPages = new Map(activeScopes.map((scope) => [scope, scope.nextPage]));
-  const batchTasks = [];
-
-  while (batchTasks.length < batchSize) {
-    let addedInPass = false;
-
-    for (const scope of activeScopes) {
-      const nextPage = nextPages.get(scope);
-
-      if (!Number.isFinite(nextPage)) {
-        continue;
-      }
-
-      if (scope.pagesRemaining <= 0) {
-        continue;
-      }
-
-      if (scope.totalPages > 0 && nextPage > scope.totalPages) {
-        continue;
-      }
-
-      batchTasks.push({
-        scope,
-        sourcePage: nextPage,
-      });
-      nextPages.set(scope, nextPage + 1);
-      addedInPass = true;
-
-      if (batchTasks.length >= batchSize) {
-        break;
-      }
-    }
-
-    if (!addedInPass) {
-      break;
-    }
-  }
-
-  return batchTasks;
-}
-
-function resolveCatalogDisplayTitle(record) {
-  const simplifiedTitle = normalizeTitle(record?.simplifiedTitle);
-  if (isUsableTmdbChineseTitle(simplifiedTitle)) {
-    return simplifiedTitle;
-  }
-
-  const traditionalTitle = normalizeTitle(record?.traditionalTitle);
-  if (isUsableTmdbChineseTitle(traditionalTitle)) {
-    return traditionalTitle;
-  }
-
-  return '';
-}
-
-function hasLocalizedChineseCatalogTitle(record) {
-  return Boolean(resolveCatalogDisplayTitle(record));
-}
-
-function collectLocalizedCatalogRecords(records) {
-  return records.filter((record) => hasLocalizedChineseCatalogTitle(record));
-}
-
-function collectCatalogCandidateRecords(records, mediaType, rule, categoryId, sortKey, todayDate) {
-  return records.filter((record) => {
-    if (!isAllowedRecord(record, todayDate, categoryId, sortKey)) {
-      return false;
-    }
-
-    const matchedRule = classifyMediaRecord(mediaType, record);
-    return Boolean(matchedRule && matchedRule.id === rule.id);
-  });
-}
-
-function collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected) {
-  for (const record of candidateRecords) {
-    const displayTitle = resolveCatalogDisplayTitle(record);
-
-    if (!displayTitle) {
-      continue;
-    }
-
-    const recordKey = `${record.mediaType}:${record.tmdbId}`;
-    if (seenRecordKeys.has(recordKey)) {
-      continue;
-    }
-
-    record.displayTitle = displayTitle;
-    seenRecordKeys.add(recordKey);
-    collected.push(record);
-  }
-}
-
-async function collectCatalogRecords({
-  params,
-  runtime,
-  todayDate,
-  selectedScopes,
-  sourceFetchConcurrency = CATALOG_SOURCE_FETCH_CONCURRENCY,
-}) {
+async function collectCatalogRecordsForScope({ params, scope, tmdbGet, todayDate }) {
   const collected = [];
-  const seenRecordKeys = new Set();
-  
-  while (selectedScopes.some((scope) => !scope.exhausted)) {
-    const batchSize = Math.min(sourceFetchConcurrency, selectedScopes.filter((scope) => !scope.exhausted).length);
-    const batchTasks = buildSourcePageBatch(
-      selectedScopes,
-      batchSize,
-    );
+  let knownTotalPages = null;
 
-    if (!batchTasks.length) {
+  // 这里刻意按“固定窗口”取页：当前 Forward 页只绑定一段 TMDb 远端页，
+  // 不回扫历史页，也不为凑满数量继续补抓后续页。
+  for (let offset = 0; offset < scope.requestedSourcePages; offset += 1) {
+    const sourcePage = scope.startPage + offset;
+
+    if (Number.isFinite(knownTotalPages) && sourcePage > knownTotalPages) {
       break;
     }
 
-    const [simplifiedResponses, traditionalResponses] = await Promise.all([
-      Promise.all(
-        batchTasks.map(({ scope, sourcePage }) =>
-          fetchCatalogSimplifiedPage({
-            mediaType: scope.mediaType,
-            categoryId: params.categoryId,
-            rule: scope.rule,
-            sortKey: params.sortKey,
-            sourcePage,
-            runtime,
-            todayDate,
-          }),
-        ),
-      ),
-      Promise.all(
-        batchTasks.map(({ scope, sourcePage }) =>
-          fetchCatalogTraditionalPage({
-            mediaType: scope.mediaType,
-            categoryId: params.categoryId,
-            rule: scope.rule,
-            sortKey: params.sortKey,
-            sourcePage,
-            runtime,
-            todayDate,
-          }),
-        ),
-      ),
-    ]);
-    const scopeBatchStates = new Map();
+    const localizedPage = await fetchLocalizedDiscoverPage({
+      mediaType: scope.mediaType,
+      categoryId: params.categoryId,
+      rule: scope.rule,
+      sortKey: params.sortKey,
+      sourcePage,
+      tmdbGet,
+      todayDate,
+    });
 
-    for (const [index, task] of batchTasks.entries()) {
-      const simplifiedResponse = simplifiedResponses[index] ?? {};
-      const traditionalResponse = traditionalResponses[index] ?? {};
-      const scope = task.scope;
-      scope.totalPages = Math.max(scope.totalPages ?? 0, simplifiedResponse.total_pages ?? 0);
-      const mergedPage = mergeLocalizedResults(scope.mediaType, simplifiedResponse, traditionalResponse);
-      const localizedRecords = collectLocalizedCatalogRecords(mergedPage.results);
-      const candidateRecords = collectCatalogCandidateRecords(
-        localizedRecords,
-        scope.mediaType,
-        scope.rule,
-        params.categoryId,
-        params.sortKey,
-        todayDate,
-      );
-
-      collectDisplayableCatalogRecords(candidateRecords, seenRecordKeys, collected);
-
-      if (!scopeBatchStates.has(scope)) {
-        scopeBatchStates.set(scope, []);
-      }
-
-      scopeBatchStates.get(scope).push({
-        sourcePage: task.sourcePage,
-        totalPages: simplifiedResponse.total_pages ?? 0,
-        resultsLength: simplifiedResponse.results?.length ?? 0,
-      });
+    if (localizedPage.totalPages > 0) {
+      knownTotalPages = localizedPage.totalPages;
     }
 
-    for (const [scope, taskStates] of scopeBatchStates.entries()) {
-      const maxScheduledPage = Math.max(...taskStates.map((state) => state.sourcePage));
-      const hasAnyResults = taskStates.some((state) => state.resultsLength > 0);
-      const knownTotalPages = Math.max(...taskStates.map((state) => state.totalPages));
-      const nextPage = maxScheduledPage + 1;
-
-      if (knownTotalPages > 0 && nextPage > knownTotalPages) {
-        scope.exhausted = true;
+    for (const record of localizedPage.results) {
+      // 过滤顺序固定：先看简/繁中文标题是否存在，再做业务过滤，最后才做分类命中判断。
+      const displayTitle = resolveCatalogDisplayTitle(record);
+      if (!displayTitle) {
         continue;
       }
 
-      if (!hasAnyResults && knownTotalPages === 0) {
-        scope.exhausted = true;
+      if (!isAllowedRecord(record, todayDate, params.categoryId, params.sortKey)) {
         continue;
       }
 
-      scope.pagesRemaining = Math.max(0, scope.pagesRemaining - taskStates.length);
-      if (scope.pagesRemaining <= 0) {
-        scope.exhausted = true;
+      const matchedRule = classifyMediaRecord(scope.mediaType, record);
+      if (!matchedRule || matchedRule.id !== scope.rule.id) {
         continue;
       }
 
-      scope.nextPage = nextPage;
+      record.displayTitle = displayTitle;
+      collected.push(record);
     }
   }
 
   return collected;
 }
 
-function classifyMediaRecord(mediaType, record) {
-  const rules = getRules(mediaType);
+function dedupeCatalogRecords(records) {
+  const deduped = [];
+  const seenRecordKeys = new Set();
 
-  for (const rule of rules) {
-    if (rule.catchAll || matchesRule(record, rule)) {
-      return rule;
+  for (const record of records) {
+    const recordKey = `${record.mediaType}:${record.tmdbId}`;
+    if (seenRecordKeys.has(recordKey)) {
+      continue;
     }
+
+    seenRecordKeys.add(recordKey);
+    deduped.push(record);
   }
 
-  return null;
+  return deduped;
 }
 
 function compareText(left, right) {
@@ -3078,157 +1181,14 @@ function sortCatalogRecords(records, sortKey) {
   return sorted;
 }
 
-const DETAIL_LINK_SCHEME = 'fw-tmdb:';
+function buildDescription(record, categoryTitle) {
+  const header = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
+  const overview = normalizeTitle(record.overview) || '暂无简介';
 
-function buildTmdbItemId(mediaType, tmdbId) {
-  return `${mediaType}.${tmdbId}`;
-}
-
-function buildTmdbWebLink(mediaType, tmdbId) {
-  return `${TMDB_WEB_BASE}/${mediaType}/${tmdbId}`;
-}
-
-function buildDetailLink({ mediaType, tmdbId, seasonNumber, episodeNumber, translationConfig }) {
-  const queryParams = {};
-
-  if (isMeaningfulText(translationConfig?.baseUrl)) {
-    queryParams[GLOBAL_PARAM_KEYS.TRANSLATION_API_BASE_URL] = translationConfig.baseUrl;
-  }
-
-  if (isMeaningfulText(translationConfig?.token)) {
-    queryParams[GLOBAL_PARAM_KEYS.TRANSLATION_API_TOKEN] = translationConfig.token;
-  }
-
-  if (isMeaningfulText(translationConfig?.model)) {
-    queryParams[GLOBAL_PARAM_KEYS.TRANSLATION_MODEL] = translationConfig.model;
-  }
-
-  let link = `${DETAIL_LINK_SCHEME}//${mediaType}/${tmdbId}`;
-
-  if (Number.isFinite(seasonNumber)) {
-    link += `/season/${seasonNumber}`;
-  }
-
-  if (Number.isFinite(episodeNumber)) {
-    link += `/episode/${episodeNumber}`;
-  }
-
-  const queryString = buildQueryString(queryParams);
-  return queryString ? `${link}?${queryString}` : link;
-}
-
-function parseDetailLink(link) {
-  const normalizedLink = normalizeTitle(link);
-  const schemePrefix = `${DETAIL_LINK_SCHEME}//`;
-
-  if (!normalizedLink.startsWith(schemePrefix)) {
-    throw new Error(`不支持的详情链接：${link}`);
-  }
-
-  const [pathPart, rawQuery = ''] = normalizedLink.split('?');
-  const pathWithoutScheme = pathPart.slice(schemePrefix.length);
-  const segments = pathWithoutScheme.split('/').filter(Boolean);
-  const mediaType = segments[0] ?? '';
-  const tmdbId = Number.parseInt(segments[1] ?? '', 10);
-
-  if (!Number.isFinite(tmdbId) || ![MEDIA_TYPES.MOVIE, MEDIA_TYPES.TV].includes(mediaType)) {
-    throw new Error(`无效的详情链接：${link}`);
-  }
-
-  const seasonIndex = segments.indexOf('season');
-  const episodeIndex = segments.indexOf('episode');
-  const seasonNumber = seasonIndex !== -1 ? Number.parseInt(segments[seasonIndex + 1] ?? '', 10) : null;
-  const episodeNumber = episodeIndex !== -1 ? Number.parseInt(segments[episodeIndex + 1] ?? '', 10) : null;
-
-  return {
-    link,
-    mediaType,
-    tmdbId,
-    seasonNumber: Number.isFinite(seasonNumber) ? seasonNumber : null,
-    episodeNumber: Number.isFinite(episodeNumber) ? episodeNumber : null,
-    rawParams: parseQueryString(rawQuery),
-  };
-}
-
-function formatRatingValue(voteAverage) {
-  return Number.isFinite(voteAverage) ? voteAverage.toFixed(1) : undefined;
-}
-
-function buildDescriptionText(parts, overview) {
-  const header = parts.filter(Boolean).join(' · ');
-  const normalizedOverview = normalizeTitle(overview);
-
-  if (header && normalizedOverview) {
-    return `${header}\n${normalizedOverview}`;
-  }
-
-  return header || normalizedOverview || undefined;
-}
-
-function applyTranslationFailureNotes(records, runtime) {
-  if (!Array.isArray(records) || !records.length) {
-    return records;
-  }
-
-  for (const record of records) {
-    if (!shouldAttemptMachineTranslation(record)) {
-      continue;
-    }
-
-    const jobDiagnostics = runtime.translationDiagnostics.jobs.get(buildTranslationJob(record).jobKey);
-
-    if (jobDiagnostics?.finalFailure) {
-      record.translationFailureNote = buildTranslationFailureNote(jobDiagnostics);
-    }
-  }
-
-  finalizeTranslationDiagnostics(runtime);
-  return records;
-}
-
-function buildDetailItem(record, link, description, { childItems = [], genreTitle } = {}) {
-  return {
-    id: String(record.tmdbId),
-    tmdbId: record.tmdbId,
-    type: 'detail',
-    link,
-    title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
-    posterPath: record.posterPath,
-    backdropPath: record.backdropPath,
-    releaseDate: record.releaseDate || undefined,
-    mediaType: record.mediaType,
-    rating: formatRatingValue(record.voteAverage),
-    genreTitle: genreTitle ?? (record.genreIds?.length ? buildGenreText(record.genreIds, record.mediaType) : undefined),
-    description,
-    childItems: childItems.length ? childItems : undefined,
-  };
-}
-
-function buildChildDetailItem(record, link, description, { mediaType = record.mediaType } = {}) {
-  return {
-    id: String(record.tmdbId),
-    tmdbId: record.tmdbId,
-    type: 'detail',
-    link,
-    title: record.displayTitle || record.originalTitle || `${mediaType}-${record.tmdbId}`,
-    posterPath: record.posterPath,
-    backdropPath: record.backdropPath,
-    releaseDate: record.releaseDate || undefined,
-    mediaType,
-    rating: formatRatingValue(record.voteAverage),
-    description,
-  };
+  return [header, overview].filter(Boolean).join('\n') || undefined;
 }
 
 function mapRecordToVideoItem(record, categoryTitle) {
-  const detailText = [record.releaseDate, categoryTitle].filter(Boolean).join(' · ');
-  const overview = normalizeTitle(record.overview) || '暂无简介';
-  const descriptionLines = [detailText, overview];
-
-  if (isMeaningfulText(record.translationFailureNote)) {
-    descriptionLines.push(record.translationFailureNote);
-  }
-
   return {
     id: String(record.tmdbId),
     tmdbId: record.tmdbId,
@@ -3239,355 +1199,17 @@ function mapRecordToVideoItem(record, categoryTitle) {
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
-    description: descriptionLines.filter(Boolean).join('\n') || undefined,
+    description: buildDescription(record, categoryTitle),
   };
-}
-
-async function fetchLocalizedTmdbResource(path, runtime, { params = {}, shouldFetchTraditional } = {}) {
-  const simplified = await cachedTmdbGet(path, {
-    params: {
-      ...params,
-      language: TMDB_LANGUAGE_SIMPLIFIED,
-    },
-  }, runtime);
-
-  let traditional = null;
-  if (!shouldFetchTraditional || shouldFetchTraditional(simplified)) {
-    traditional = await cachedTmdbGet(path, {
-      params: {
-        ...params,
-        language: TMDB_LANGUAGE_TRADITIONAL,
-      },
-    }, runtime);
-  }
-
-  return {
-    simplified,
-    traditional,
-  };
-}
-
-function shouldFetchTraditionalForMovieDetail(simplifiedResponse) {
-  return (
-    !isUsableTmdbChineseTitle(simplifiedResponse?.title)
-    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
-  );
-}
-
-function shouldFetchTraditionalForSeriesDetail(simplifiedResponse) {
-  if (
-    !isUsableTmdbChineseTitle(simplifiedResponse?.name)
-    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
-  ) {
-    return true;
-  }
-
-  return (simplifiedResponse?.seasons ?? []).some((season) => !isUsableTmdbChineseTitle(season?.name));
-}
-
-function shouldFetchTraditionalForSeasonDetail(simplifiedResponse) {
-  if (
-    !isUsableTmdbChineseTitle(simplifiedResponse?.name)
-    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
-  ) {
-    return true;
-  }
-
-  return (simplifiedResponse?.episodes ?? []).some((episode) => (
-    !isUsableTmdbChineseTitle(episode?.name)
-    || !isUsableTmdbChineseText(episode?.overview)
-  ));
-}
-
-function shouldFetchTraditionalForEpisodeDetail(simplifiedResponse) {
-  return (
-    !isUsableTmdbChineseTitle(simplifiedResponse?.name)
-    || !isUsableTmdbChineseText(simplifiedResponse?.overview)
-  );
-}
-
-function buildMovieDetailRecord(localizedMovie) {
-  return buildLocalizedRecord({
-    tmdbId: localizedMovie.simplified?.id ?? localizedMovie.traditional?.id,
-    mediaType: MEDIA_TYPES.MOVIE,
-    simplifiedItem: localizedMovie.simplified,
-    traditionalItem: localizedMovie.traditional,
-    titleSelector: (item) => item?.title,
-    originalTitleSelector: (item) => item?.original_title,
-  });
-}
-
-function buildSeriesDetailRecord(localizedSeries) {
-  return buildLocalizedRecord({
-    tmdbId: localizedSeries.simplified?.id ?? localizedSeries.traditional?.id,
-    mediaType: MEDIA_TYPES.TV,
-    simplifiedItem: localizedSeries.simplified,
-    traditionalItem: localizedSeries.traditional,
-    titleSelector: (item) => item?.name,
-    originalTitleSelector: (item) => item?.original_name,
-    genreIdsSelector: (item) => Array.isArray(item?.genres) ? item.genres.map((genre) => genre.id).filter(Number.isFinite) : [],
-  });
-}
-
-function buildSeasonRecords(localizedSeries) {
-  return collectLocalizedEntries(
-    localizedSeries.simplified?.seasons ?? [],
-    localizedSeries.traditional?.seasons ?? [],
-    (season) => season.season_number,
-  )
-    .map(({ key, simplified, traditional }) => {
-      const record = buildLocalizedRecord({
-        tmdbId: simplified?.id ?? traditional?.id ?? key,
-        mediaType: MEDIA_TYPES.TV,
-        simplifiedItem: simplified,
-        traditionalItem: traditional,
-        titleSelector: (item) => item?.name,
-        originalTitleSelector: (item) => item?.name,
-        dateSelector: (item) => item?.air_date,
-        genreIdsSelector: () => [],
-        originalLanguageSelector: () => '',
-        originCountrySelector: () => [],
-        adultSelector: () => false,
-        voteCountSelector: () => 0,
-        voteAverageSelector: () => NaN,
-        backdropPathSelector: (item) => item?.poster_path,
-      });
-
-      if (!record) {
-        return null;
-      }
-
-      record.seasonNumber = key;
-      return record;
-    })
-    .filter(Boolean)
-    .sort((left, right) => (left.seasonNumber ?? 0) - (right.seasonNumber ?? 0));
-}
-
-function buildSeasonDetailRecord(localizedSeason, seriesId, seasonNumber) {
-  const record = buildLocalizedRecord({
-    tmdbId: localizedSeason.simplified?.id ?? localizedSeason.traditional?.id ?? seasonNumber,
-    mediaType: MEDIA_TYPES.TV,
-    simplifiedItem: localizedSeason.simplified,
-    traditionalItem: localizedSeason.traditional,
-    titleSelector: (item) => item?.name,
-    originalTitleSelector: (item) => item?.name,
-    dateSelector: (item) => item?.air_date,
-    genreIdsSelector: () => [],
-    originalLanguageSelector: () => '',
-    originCountrySelector: () => [],
-    adultSelector: () => false,
-    voteCountSelector: () => 0,
-    voteAverageSelector: () => NaN,
-    backdropPathSelector: (item) => item?.poster_path,
-  });
-
-  if (record) {
-    record.parentTmdbId = seriesId;
-    record.seasonNumber = seasonNumber;
-  }
-
-  return record;
-}
-
-function buildEpisodeRecords(localizedSeason, seriesId, seasonNumber) {
-  return collectLocalizedEntries(
-    localizedSeason.simplified?.episodes ?? [],
-    localizedSeason.traditional?.episodes ?? [],
-    (episode) => episode.episode_number,
-  )
-    .map(({ key, simplified, traditional }) => {
-      const record = buildLocalizedRecord({
-        tmdbId: simplified?.id ?? traditional?.id ?? key,
-        mediaType: MEDIA_TYPES.TV,
-        simplifiedItem: simplified,
-        traditionalItem: traditional,
-        titleSelector: (item) => item?.name,
-        originalTitleSelector: (item) => item?.name,
-        dateSelector: (item) => item?.air_date,
-        genreIdsSelector: () => [],
-        originalLanguageSelector: () => '',
-        originCountrySelector: () => [],
-        adultSelector: () => false,
-        voteCountSelector: () => 0,
-        voteAverageSelector: () => NaN,
-        posterPathSelector: (item) => item?.still_path,
-        backdropPathSelector: (item) => item?.still_path,
-      });
-
-      if (!record) {
-        return null;
-      }
-
-      record.parentTmdbId = seriesId;
-      record.seasonNumber = seasonNumber;
-      record.episodeNumber = key;
-      return record;
-    })
-    .filter(Boolean)
-    .sort((left, right) => (left.episodeNumber ?? 0) - (right.episodeNumber ?? 0));
-}
-
-function buildEpisodeDetailRecord(localizedEpisode, seriesId, seasonNumber, episodeNumber) {
-  const record = buildLocalizedRecord({
-    tmdbId: localizedEpisode.simplified?.id ?? localizedEpisode.traditional?.id ?? episodeNumber,
-    mediaType: MEDIA_TYPES.TV,
-    simplifiedItem: localizedEpisode.simplified,
-    traditionalItem: localizedEpisode.traditional,
-    titleSelector: (item) => item?.name,
-    originalTitleSelector: (item) => item?.name,
-    dateSelector: (item) => item?.air_date,
-    genreIdsSelector: () => [],
-    originalLanguageSelector: () => '',
-    originCountrySelector: () => [],
-    adultSelector: () => false,
-    voteCountSelector: () => 0,
-    voteAverageSelector: () => NaN,
-    posterPathSelector: (item) => item?.still_path,
-    backdropPathSelector: (item) => item?.still_path,
-  });
-
-  if (record) {
-    record.parentTmdbId = seriesId;
-    record.seasonNumber = seasonNumber;
-    record.episodeNumber = episodeNumber;
-  }
-
-  return record;
-}
-
-async function loadMovieDetailFromLink(parsedLink, runtime) {
-  const localizedMovie = await fetchLocalizedTmdbResource(`movie/${parsedLink.tmdbId}`, runtime, {
-    shouldFetchTraditional: shouldFetchTraditionalForMovieDetail,
-  });
-  const movieRecord = buildMovieDetailRecord(localizedMovie);
-
-  await applyMachineTranslationFallback([movieRecord], runtime.translationConfig, runtime);
-  await applyOverviewTranslationFallback([movieRecord], runtime.translationConfig, runtime);
-
-  return buildDetailItem(
-    movieRecord,
-    parsedLink.link,
-    buildDescriptionText(
-      [movieRecord.releaseDate, buildGenreText(movieRecord.genreIds, movieRecord.mediaType)],
-      movieRecord.overview || '暂无简介',
-    ),
-  );
-}
-
-async function loadSeriesDetailFromLink(parsedLink, runtime) {
-  const localizedSeries = await fetchLocalizedTmdbResource(`tv/${parsedLink.tmdbId}`, runtime, {
-    shouldFetchTraditional: shouldFetchTraditionalForSeriesDetail,
-  });
-  const seriesRecord = buildSeriesDetailRecord(localizedSeries);
-  const seasonRecords = buildSeasonRecords(localizedSeries);
-
-  await applyMachineTranslationFallback([seriesRecord, ...seasonRecords], runtime.translationConfig, runtime);
-  await applyOverviewTranslationFallback([seriesRecord], runtime.translationConfig, runtime);
-
-  const childItems = seasonRecords.map((seasonRecord) =>
-    buildChildDetailItem(
-      seasonRecord,
-      buildDetailLink({
-        mediaType: MEDIA_TYPES.TV,
-        tmdbId: parsedLink.tmdbId,
-        seasonNumber: seasonRecord.seasonNumber,
-        translationConfig: runtime.translationConfig,
-      }),
-      buildDescriptionText(
-        [seasonRecord.releaseDate, `第 ${seasonRecord.seasonNumber} 季`],
-        seasonRecord.overview || '暂无简介',
-      ),
-    ));
-
-  return buildDetailItem(
-    seriesRecord,
-    parsedLink.link,
-    buildDescriptionText(
-      [seriesRecord.releaseDate, buildGenreText(seriesRecord.genreIds, seriesRecord.mediaType)],
-      seriesRecord.overview || '暂无简介',
-    ),
-    { childItems },
-  );
-}
-
-async function loadSeasonDetailFromLink(parsedLink, runtime) {
-  const localizedSeason = await fetchLocalizedTmdbResource(
-    `tv/${parsedLink.tmdbId}/season/${parsedLink.seasonNumber}`,
-    runtime,
-    { shouldFetchTraditional: shouldFetchTraditionalForSeasonDetail },
-  );
-  const seasonRecord = buildSeasonDetailRecord(localizedSeason, parsedLink.tmdbId, parsedLink.seasonNumber);
-  const episodeRecords = buildEpisodeRecords(localizedSeason, parsedLink.tmdbId, parsedLink.seasonNumber);
-
-  await applyMachineTranslationFallback([seasonRecord, ...episodeRecords], runtime.translationConfig, runtime);
-
-  const childItems = episodeRecords.map((episodeRecord) =>
-    buildChildDetailItem(
-      episodeRecord,
-      buildDetailLink({
-        mediaType: MEDIA_TYPES.TV,
-        tmdbId: parsedLink.tmdbId,
-        seasonNumber: parsedLink.seasonNumber,
-        episodeNumber: episodeRecord.episodeNumber,
-        translationConfig: runtime.translationConfig,
-      }),
-      buildDescriptionText(
-        [episodeRecord.releaseDate, `第 ${episodeRecord.episodeNumber} 集`],
-        episodeRecord.overview || '暂无简介',
-      ),
-    ));
-
-  return buildDetailItem(
-    seasonRecord,
-    parsedLink.link,
-    buildDescriptionText(
-      [seasonRecord.releaseDate, `第 ${parsedLink.seasonNumber} 季`],
-      seasonRecord.overview || '暂无简介',
-    ),
-    { childItems, genreTitle: undefined },
-  );
-}
-
-async function loadEpisodeDetailFromLink(parsedLink, runtime) {
-  const localizedEpisode = await fetchLocalizedTmdbResource(
-    `tv/${parsedLink.tmdbId}/season/${parsedLink.seasonNumber}/episode/${parsedLink.episodeNumber}`,
-    runtime,
-    { shouldFetchTraditional: shouldFetchTraditionalForEpisodeDetail },
-  );
-  const episodeRecord = buildEpisodeDetailRecord(
-    localizedEpisode,
-    parsedLink.tmdbId,
-    parsedLink.seasonNumber,
-    parsedLink.episodeNumber,
-  );
-
-  await applyMachineTranslationFallback([episodeRecord], runtime.translationConfig, runtime);
-
-  return buildDetailItem(
-    episodeRecord,
-    parsedLink.link,
-    buildDescriptionText(
-      [episodeRecord.releaseDate, `第 ${parsedLink.episodeNumber} 集`],
-      episodeRecord.overview || '暂无简介',
-    ),
-    { genreTitle: undefined },
-  );
 }
 
 function getLegacyCategoryValue(params = {}) {
-  const legacyMediaType =
-    params.mediaType === MEDIA_TYPES.TV ? MEDIA_TYPES.TV : MEDIA_TYPES.MOVIE;
-
+  const legacyMediaType = params.mediaType === MEDIA_TYPES.TV ? MEDIA_TYPES.TV : MEDIA_TYPES.MOVIE;
   return legacyMediaType === MEDIA_TYPES.TV ? params.tvCategory : params.movieCategory;
 }
 
 function normalizeBrowseParams(params = {}) {
-  const sortValue =
-    params.sort_by ??
-    params.movieSort ??
-    params.tvSort;
-
+  const sortValue = params.sort_by ?? params.movieSort ?? params.tvSort;
   const categoryId = pickValidValue(
     params.category ?? getLegacyCategoryValue(params),
     getCategoryOptions(),
@@ -3605,52 +1227,10 @@ function normalizeBrowseParams(params = {}) {
   };
 }
 
-function shouldUseCatalogProxy(overrides = {}) {
-  if (overrides.disableCatalogProxy === true) {
-    return false;
-  }
-
-  if (overrides.forceCatalogProxy === true) {
-    return true;
-  }
-
-  return !overrides.tmdbGet;
-}
-
-async function requestCatalogProxyItems(rawParams, overrides = {}) {
-  const httpPost = overrides.httpPost ?? getDefaultHttpPost();
-  const normalizedParams = normalizeBrowseParams(rawParams);
-  const response = await httpPost(
-    CATALOG_PROXY_URL,
-    {
-      category: normalizedParams.categoryId,
-      sort_by: normalizedParams.sortKey,
-      count: String(normalizedParams.count),
-      page: String(normalizedParams.page),
-    },
-    {
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      timeoutMs: 15 * 1000,
-    },
-  );
-
-  if (Array.isArray(response?.items)) {
-    return response.items;
-  }
-
-  if (Array.isArray(response)) {
-    return response;
-  }
-
-  throw new Error('目录代理返回格式异常');
-}
-
-async function browseCatalogDirect(rawParams = {}, overrides = {}) {
+async function browseCatalog(rawParams = {}, overrides = {}) {
   const params = normalizeBrowseParams(rawParams);
-  const runtime = createRuntime(rawParams, overrides);
-  const todayDate = getTodayDateString();
+  const tmdbGet = overrides.tmdbGet ?? getDefaultTmdbGet();
+  const todayDate = overrides.todayDate ?? getTodayDateString();
   const fetchPlan = getRemotePaginationPlan(params);
   const sourceMediaTypes = getCategoryMediaTypes(params.categoryId);
   const selectedScopes = buildSelectedScopes(
@@ -3664,50 +1244,20 @@ async function browseCatalogDirect(rawParams = {}, overrides = {}) {
     throw new Error(`未知分类：${params.categoryId}`);
   }
 
-  let collected = await collectCatalogRecords({
-    params,
-    runtime,
-    todayDate,
-    selectedScopes,
-  });
+  const scopeResults = await Promise.all(
+    selectedScopes.map((scope) =>
+      collectCatalogRecordsForScope({
+        params,
+        scope,
+        tmdbGet,
+        todayDate,
+      })),
+  );
 
-  const sorted = sortCatalogRecords(collected, params.sortKey);
-  const startIndex = fetchPlan.localSkip;
-  const endIndex = startIndex + params.count;
+  const records = dedupeCatalogRecords(scopeResults.flat());
+  const sortedRecords = sortCatalogRecords(records, params.sortKey);
+  const pagedRecords = sortedRecords.slice(0, params.count);
   const categoryTitle = selectedScopes[0].rule.title;
-  const pagedRecords = sorted.slice(startIndex, endIndex);
 
-  await flushQueuedCacheWrites(runtime);
   return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
-}
-
-async function browseCatalog(rawParams = {}, overrides = {}) {
-  if (shouldUseCatalogProxy(overrides)) {
-    try {
-      return await requestCatalogProxyItems(rawParams, overrides);
-    } catch {
-      // 代理不可用时退回本地直连逻辑，避免分类墙彻底失效。
-    }
-  }
-
-  return browseCatalogDirect(rawParams, overrides);
-}
-
-async function loadCatalogDetail(link, overrides = {}) {
-  const parsedLink = parseDetailLink(link);
-  const runtime = createRuntime(parsedLink.rawParams, overrides);
-
-  let detailResult;
-  if (parsedLink.mediaType === MEDIA_TYPES.MOVIE) {
-    detailResult = await loadMovieDetailFromLink(parsedLink, runtime);
-  } else if (Number.isFinite(parsedLink.episodeNumber)) {
-    detailResult = await loadEpisodeDetailFromLink(parsedLink, runtime);
-  } else if (Number.isFinite(parsedLink.seasonNumber)) {
-    detailResult = await loadSeasonDetailFromLink(parsedLink, runtime);
-  } else {
-    detailResult = await loadSeriesDetailFromLink(parsedLink, runtime);
-  }
-
-  await flushQueuedCacheWrites(runtime);
-  return detailResult;
 }
