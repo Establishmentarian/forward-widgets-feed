@@ -37,11 +37,21 @@ const CATALOG_SOURCE_PAGE_MULTIPLIERS = Object.freeze({
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
+  strictForeignDate: 3,
 });
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const TMDB_LANGUAGE_SIMPLIFIED = 'zh-CN';
 const TMDB_LANGUAGE_TRADITIONAL = 'zh-TW';
+
+const STRICT_FOREIGN_CATEGORY_IDS = Object.freeze([
+  'western_movie',
+  'western_series',
+  'asia_pacific_movie',
+  'asia_pacific_series',
+  'documentary',
+  'concert',
+]);
 
 const CONCERT_KEYWORDS = Object.freeze([
   '演唱会',
@@ -398,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.13",
+  version: "0.6.14",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -834,9 +844,13 @@ function buildGenreText(genreIds, mediaType) {
   return genres.join(' / ');
 }
 
-function getMinimumVoteCount(sortKey) {
+function getMinimumVoteCount(categoryId, sortKey) {
   if (sortKey === SORT_KEYS.RATING_ASC || sortKey === SORT_KEYS.RATING_DESC) {
     return MIN_DISCOVER_VOTE_COUNT.rating;
+  }
+
+  if (STRICT_FOREIGN_CATEGORY_IDS.includes(categoryId)) {
+    return MIN_DISCOVER_VOTE_COUNT.strictForeignDate;
   }
 
   return MIN_DISCOVER_VOTE_COUNT.default;
@@ -885,7 +899,7 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
     include_adult: false,
     page: sourcePage,
     sort_by: getTmdbSortBy(mediaType, sortKey),
-    'vote_count.gte': getMinimumVoteCount(sortKey),
+    'vote_count.gte': getMinimumVoteCount(categoryId, sortKey),
     'vote_average.gte': 0.1,
     ...buildRuleDiscoverParams(rule),
   };
@@ -1035,7 +1049,7 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
     return false;
   }
 
-  if (!Number.isFinite(record.voteCount) || record.voteCount < getMinimumVoteCount(sortKey)) {
+  if (!Number.isFinite(record.voteCount) || record.voteCount < getMinimumVoteCount(categoryId, sortKey)) {
     return false;
   }
 
@@ -1637,6 +1651,36 @@ function getCachedPageRecords(cache, sortKey, page) {
   return normalizeCacheRecords(records);
 }
 
+function getSequentialCachedPageCount(cache, sortKey) {
+  const pagesByNumber = cache?.pages?.[sortKey];
+  if (!pagesByNumber || typeof pagesByNumber !== 'object') {
+    return 0;
+  }
+
+  let page = 1;
+  while (normalizeCacheRecords(pagesByNumber[String(page)]).length) {
+    page += 1;
+  }
+
+  return page - 1;
+}
+
+function canUseCachedRecordPool(cache, params) {
+  if (!cache?.records?.length) {
+    return false;
+  }
+
+  const requiredRecords = params.page * params.count;
+  if (cache.records.length < requiredRecords) {
+    return false;
+  }
+
+  return Math.max(
+    getSequentialCachedPageCount(cache, params.sortKey),
+    getSequentialCachedPageCount(cache, SORT_KEYS.DATE_DESC),
+  ) >= params.page;
+}
+
 function setCachedPageRecords(cache, sortKey, page, records) {
   return {
     ...(cache?.pages ?? {}),
@@ -1851,7 +1895,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     filterRecordsForResponse(getCachedPageRecords(cachedCatalog, params.sortKey, params.page), params, todayDate),
     params.sortKey,
   ).slice(0, params.count);
-  const cachedRecordPoolPage = cachedCatalog?.records.length
+  const cachedRecordPoolPage = canUseCachedRecordPool(cachedCatalog, params)
     ? paginateCacheRecords(cachedCatalog.records, params, todayDate)
     : [];
 
