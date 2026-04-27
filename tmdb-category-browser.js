@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.8",
+  version: "0.6.9",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -417,6 +417,7 @@ var WidgetMetadata = {
       title: '影视分类',
       description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
       functionName: 'browseTmdbCategories',
+      type: 'video',
       cacheDuration: 3600,
       params: [
         {
@@ -1302,19 +1303,20 @@ function mapRecordToVideoItem(record, categoryTitle) {
 
   return {
     // Forward 实际原生 TMDb 卡片识别使用“纯 TMDb ID + mediaType”。
-    // id 不能写成 movie.123/tv.123；但 link 仍按 VideoItem schema 补齐，
-    // 避免宿主刷新模块时因必填字段缺失把整页结果丢掉。
+    // 这里对齐已验证可用的全球影视专区结构，不提供自定义 link，
+    // 避免宿主把原生 TMDb 卡片误当成自定义详情链路。
     id: tmdbId,
     tmdbId: Number(record.tmdbId),
     type: 'tmdb',
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
+    subTitle: '',
     posterPath: record.posterPath,
     backdropPath: record.backdropPath,
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
-    link: `forward://tmdb?id=${encodeURIComponent(tmdbId)}&type=${encodeURIComponent(record.mediaType)}`,
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
     description: buildDescription(record, categoryTitle),
+    rating: Number.isFinite(record.voteAverage) ? record.voteAverage : 0,
   };
 }
 
