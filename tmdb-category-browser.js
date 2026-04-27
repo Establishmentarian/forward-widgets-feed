@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.15",
+  version: "0.6.16",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -561,9 +561,12 @@ function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle 
   });
 }
 
-const CACHE_VERSION = 5;
-const CACHE_KEY_PREFIX = 'tmdb-category-browser:v5';
-const LEGACY_CACHE_KEY_PREFIXES = Object.freeze(['tmdb-category-browser:v4']);
+const CACHE_VERSION = 6;
+const CACHE_KEY_PREFIX = 'tmdb-category-browser:v6';
+const LEGACY_CACHE_KEY_PREFIXES = Object.freeze([
+  'tmdb-category-browser:v5',
+  'tmdb-category-browser:v4',
+]);
 const CACHE_MAX_RECORDS = 1000;
 const TMDB_REQUEST_TIMEOUT_MS = 8000;
 const CACHE_REFRESH_TIMEOUT_MS = 1500;
@@ -2117,6 +2120,28 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     startNextPagePrefetch({ params, tmdbGet, storage, todayDate, overrides });
 
     return mapRecordsToVideoItems(cachedResponse.records, categoryTitle);
+  }
+
+  if (isPreviewPageRequest(params)) {
+    const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId);
+    const legacyFallbackRecords = getCachedFallbackRecords(legacyCachedCatalog, params, todayDate);
+    if (legacyFallbackRecords.length) {
+      const tmdbGet = createOptionalTimeoutTmdbGet(overrides);
+      if (tmdbGet) {
+        startBackgroundRefresh(
+          fetchAndCacheCurrentWindow({
+            params,
+            tmdbGet,
+            storage,
+            cache: null,
+            todayDate,
+          }),
+          overrides,
+        );
+      }
+
+      return mapRecordsToVideoItems(legacyFallbackRecords, categoryTitle);
+    }
   }
 
   const tmdbGet = createTimeoutTmdbGet(
