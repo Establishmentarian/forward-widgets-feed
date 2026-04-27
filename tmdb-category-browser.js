@@ -408,13 +408,12 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.0",
+  version: "0.6.2",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
     {
       id: 'tmdb-category-browser',
-      type: 'video',
       title: '影视分类',
       description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
       functionName: 'browseTmdbCategories',
@@ -527,10 +526,6 @@ function containsHan(value) {
   return /[\p{Script=Han}]/u.test(value);
 }
 
-function containsNonChineseScript(value) {
-  return /[A-Za-z\u3040-\u30ff\uac00-\ud7af]/u.test(value);
-}
-
 function isUsableTmdbChineseText(value) {
   const normalizedValue = normalizeTitle(value);
   return Boolean(normalizedValue && containsHan(normalizedValue));
@@ -538,7 +533,7 @@ function isUsableTmdbChineseText(value) {
 
 function isUsableTmdbChineseTitle(value) {
   const normalizedValue = normalizeTitle(value);
-  return Boolean(normalizedValue && containsHan(normalizedValue) && !containsNonChineseScript(normalizedValue));
+  return Boolean(normalizedValue && containsHan(normalizedValue));
 }
 
 function resolveLocalizedText({ simplifiedText, traditionalText, originalText }) {
@@ -564,6 +559,15 @@ function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle 
     originalText: originalTitle,
   });
 }
+
+const CACHE_VERSION = 2;
+const CACHE_KEY_PREFIX = 'tmdb-category-browser:v2';
+const CACHE_MAX_RECORDS = 1000;
+const TMDB_REQUEST_TIMEOUT_MS = 8000;
+const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
+const INCREMENTAL_REFRESH_MAX_DAYS = 7;
+const BACKFILL_INTERVAL_DAYS = 7;
+const BACKFILL_LOOKBACK_DAYS = 90;
 
 function buildImageUrl(size, path) {
   return isMeaningfulText(path) ? `${TMDB_IMAGE_BASE}/${size}${path}` : undefined;
@@ -906,6 +910,21 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
   return stringifyParams(params);
 }
 
+function applyDiscoverDateRange(params, mediaType, dateRange) {
+  if (!dateRange) {
+    return params;
+  }
+
+  const fromKey = mediaType === MEDIA_TYPES.MOVIE ? 'primary_release_date.gte' : 'first_air_date.gte';
+  const toKey = mediaType === MEDIA_TYPES.MOVIE ? 'primary_release_date.lte' : 'first_air_date.lte';
+
+  return stringifyParams({
+    ...params,
+    [fromKey]: dateRange.from,
+    [toKey]: dateRange.to,
+  });
+}
+
 function mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse) {
   const records = collectLocalizedEntries(
     simplifiedResponse?.results ?? [],
@@ -937,11 +956,16 @@ async function fetchLocalizedDiscoverPage({
   sourcePage,
   tmdbGet,
   todayDate,
+  dateRange,
 }) {
   const endpoint = mediaType === MEDIA_TYPES.MOVIE ? 'discover/movie' : 'discover/tv';
-  const commonParams = buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate);
+  const commonParams = applyDiscoverDateRange(
+    buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, todayDate),
+    mediaType,
+    dateRange,
+  );
 
-  const [simplifiedResponse, traditionalResponse] = await Promise.all([
+  const [simplifiedResult, traditionalResult] = await Promise.allSettled([
     tmdbGet(endpoint, {
       params: {
         ...commonParams,
@@ -955,6 +979,31 @@ async function fetchLocalizedDiscoverPage({
       },
     }),
   ]);
+
+  const simplifiedResponse = simplifiedResult.status === 'fulfilled' ? simplifiedResult.value : null;
+  const traditionalResponse = traditionalResult.status === 'fulfilled' ? traditionalResult.value : null;
+
+  if (!simplifiedResponse && !traditionalResponse) {
+    // 单个远端窗口页失败不应拖垮整个分类墙；保留失败上下文，方便单测和运行日志定位是哪种语言失败。
+    return {
+      results: [],
+      totalPages: 0,
+      errors: [
+        {
+          endpoint,
+          language: TMDB_LANGUAGE_SIMPLIFIED,
+          page: sourcePage,
+          reason: simplifiedResult.reason instanceof Error ? simplifiedResult.reason.message : String(simplifiedResult.reason),
+        },
+        {
+          endpoint,
+          language: TMDB_LANGUAGE_TRADITIONAL,
+          page: sourcePage,
+          reason: traditionalResult.reason instanceof Error ? traditionalResult.reason.message : String(traditionalResult.reason),
+        },
+      ],
+    };
+  }
 
   return mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse);
 }
@@ -1033,7 +1082,14 @@ function buildSelectedScopes(categoryId, sourceMediaTypes, startPage, requestedS
     .filter((scope) => scope.rule);
 }
 
-async function collectCatalogRecordsForScope({ params, scope, tmdbGet, todayDate }) {
+async function collectCatalogRecordsForScope({
+  params,
+  scope,
+  tmdbGet,
+  todayDate,
+  sortKey = params.sortKey,
+  dateRange,
+}) {
   const collected = [];
   let knownTotalPages = null;
 
@@ -1050,10 +1106,11 @@ async function collectCatalogRecordsForScope({ params, scope, tmdbGet, todayDate
       mediaType: scope.mediaType,
       categoryId: params.categoryId,
       rule: scope.rule,
-      sortKey: params.sortKey,
+      sortKey,
       sourcePage,
       tmdbGet,
       todayDate,
+      dateRange,
     });
 
     if (localizedPage.totalPages > 0) {
@@ -1067,7 +1124,7 @@ async function collectCatalogRecordsForScope({ params, scope, tmdbGet, todayDate
         continue;
       }
 
-      if (!isAllowedRecord(record, todayDate, params.categoryId, params.sortKey)) {
+      if (!isAllowedRecord(record, todayDate, params.categoryId, sortKey)) {
         continue;
       }
 
@@ -1082,6 +1139,37 @@ async function collectCatalogRecordsForScope({ params, scope, tmdbGet, todayDate
   }
 
   return collected;
+}
+
+async function collectCatalogRecords({ params, tmdbGet, todayDate, fetchPlan, sortKey, dateRange }) {
+  const sourceMediaTypes = getCategoryMediaTypes(params.categoryId);
+  const selectedScopes = buildSelectedScopes(
+    params.categoryId,
+    sourceMediaTypes,
+    fetchPlan.sourceStartPage,
+    fetchPlan.requestedSourcePages,
+  );
+
+  if (!selectedScopes.length) {
+    throw new Error(`未知分类：${params.categoryId}`);
+  }
+
+  const scopeResults = await Promise.all(
+    selectedScopes.map((scope) =>
+      collectCatalogRecordsForScope({
+        params,
+        scope,
+        tmdbGet,
+        todayDate,
+        sortKey,
+        dateRange,
+      })),
+  );
+
+  return {
+    records: dedupeCatalogRecords(scopeResults.flat()),
+    categoryTitle: selectedScopes[0].rule.title,
+  };
 }
 
 function dedupeCatalogRecords(records) {
@@ -1189,8 +1277,10 @@ function buildDescription(record, categoryTitle) {
 }
 
 function mapRecordToVideoItem(record, categoryTitle) {
+  const tmdbId = String(record.tmdbId);
+
   return {
-    id: String(record.tmdbId),
+    id: `${record.mediaType}.${tmdbId}`,
     tmdbId: record.tmdbId,
     type: 'tmdb',
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
@@ -1198,9 +1288,246 @@ function mapRecordToVideoItem(record, categoryTitle) {
     backdropPath: record.backdropPath,
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
+    link: `forward://tmdb?id=${encodeURIComponent(tmdbId)}&type=${encodeURIComponent(record.mediaType)}`,
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
     description: buildDescription(record, categoryTitle),
   };
+}
+
+function getCatalogCacheKey(categoryId) {
+  return `${CACHE_KEY_PREFIX}:${categoryId}`;
+}
+
+function getDefaultStorage() {
+  if (typeof Widget === 'undefined' || !Widget?.storage) {
+    return null;
+  }
+
+  return Widget.storage;
+}
+
+function createEmptyCache(categoryId, todayDate) {
+  return {
+    version: CACHE_VERSION,
+    categoryId,
+    lastSyncDate: todayDate,
+    lastBackfillDate: '',
+    records: [],
+  };
+}
+
+function isValidCacheRecord(record) {
+  return (
+    record &&
+    Number.isFinite(record.tmdbId) &&
+    (record.mediaType === MEDIA_TYPES.MOVIE || record.mediaType === MEDIA_TYPES.TV) &&
+    isMeaningfulText(record.displayTitle)
+  );
+}
+
+function normalizeCache(rawCache, categoryId) {
+  if (
+    !rawCache ||
+    rawCache.version !== CACHE_VERSION ||
+    rawCache.categoryId !== categoryId ||
+    !Array.isArray(rawCache.records)
+  ) {
+    return null;
+  }
+
+  return {
+    version: CACHE_VERSION,
+    categoryId,
+    lastSyncDate: normalizeTitle(rawCache.lastSyncDate),
+    lastBackfillDate: normalizeTitle(rawCache.lastBackfillDate),
+    records: rawCache.records.filter(isValidCacheRecord),
+  };
+}
+
+async function readCatalogCache(storage, categoryId) {
+  if (!storage?.get) {
+    return null;
+  }
+
+  try {
+    const rawValue = await storage.get(getCatalogCacheKey(categoryId));
+    if (!rawValue) {
+      return null;
+    }
+
+    return normalizeCache(JSON.parse(rawValue), categoryId);
+  } catch {
+    return null;
+  }
+}
+
+async function writeCatalogCache(storage, cache) {
+  if (!storage?.set || !cache) {
+    return;
+  }
+
+  try {
+    await storage.set(getCatalogCacheKey(cache.categoryId), JSON.stringify(cache));
+  } catch {
+    // 缓存只是加速与兜底层，写入失败不能影响当前页面展示。
+  }
+}
+
+function mergeCachedRecords(existingRecords = [], incomingRecords = []) {
+  const mergedByKey = new Map();
+
+  for (const record of existingRecords) {
+    if (isValidCacheRecord(record)) {
+      mergedByKey.set(`${record.mediaType}:${record.tmdbId}`, record);
+    }
+  }
+
+  for (const record of incomingRecords) {
+    if (isValidCacheRecord(record)) {
+      mergedByKey.set(`${record.mediaType}:${record.tmdbId}`, record);
+    }
+  }
+
+  return sortCatalogRecords([...mergedByKey.values()], SORT_KEYS.DATE_DESC).slice(0, CACHE_MAX_RECORDS);
+}
+
+function getDateMs(dateText) {
+  const timestamp = Date.parse(dateText || '');
+  return Number.isNaN(timestamp) ? NaN : timestamp;
+}
+
+function getDaysBetween(leftDate, rightDate) {
+  const leftMs = getDateMs(leftDate);
+  const rightMs = getDateMs(rightDate);
+
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(0, Math.floor((rightMs - leftMs) / 86400000));
+}
+
+function shiftDate(dateText, offsetDays) {
+  const timestamp = getDateMs(dateText);
+  if (!Number.isFinite(timestamp)) {
+    return '';
+  }
+
+  const date = new Date(timestamp);
+  date.setUTCDate(date.getUTCDate() + offsetDays);
+  return date.toISOString().slice(0, 10);
+}
+
+function createTimeoutTmdbGet(tmdbGet, timeoutMs = TMDB_REQUEST_TIMEOUT_MS) {
+  return (pathName, options = {}) => {
+    if (typeof setTimeout !== 'function' || typeof clearTimeout !== 'function') {
+      return tmdbGet(pathName, options);
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`TMDb request timeout after ${timeoutMs}ms: ${pathName}`));
+      }, timeoutMs);
+
+      Promise.resolve()
+        .then(() => tmdbGet(pathName, options))
+        .then(resolve, reject)
+        .finally(() => clearTimeout(timer));
+    });
+  };
+}
+
+function filterRecordsForResponse(records, params, todayDate) {
+  return records.filter((record) => isAllowedRecord(record, todayDate, params.categoryId, params.sortKey));
+}
+
+function paginateCacheRecords(records, params, todayDate) {
+  const filteredRecords = filterRecordsForResponse(records, params, todayDate);
+  const sortedRecords = sortCatalogRecords(filteredRecords, params.sortKey);
+  const startIndex = (params.page - 1) * params.count;
+  return sortedRecords.slice(startIndex, startIndex + params.count);
+}
+
+function mapRecordsToVideoItems(records, categoryTitle) {
+  return records.map((record) => mapRecordToVideoItem(record, categoryTitle));
+}
+
+function getCategoryTitle(categoryId) {
+  const mediaType = getCategoryMediaTypes(categoryId)[0] ?? MEDIA_TYPES.MOVIE;
+  return getRuleById(mediaType, categoryId)?.title ?? categoryId;
+}
+
+function startBackgroundRefresh(task, overrides) {
+  const safeTask = task.catch(() => {});
+  if (Array.isArray(overrides.backgroundTasks)) {
+    overrides.backgroundTasks.push(safeTask);
+  }
+}
+
+async function refreshCatalogCache({ params, tmdbGet, storage, cache, todayDate }) {
+  let nextCache = cache ?? createEmptyCache(params.categoryId, todayDate);
+  let nextRecords = nextCache.records;
+  const daysSinceSync = getDaysBetween(nextCache.lastSyncDate, todayDate);
+  const daysSinceBackfill = getDaysBetween(nextCache.lastBackfillDate || nextCache.lastSyncDate, todayDate);
+
+  if (daysSinceSync <= 0) {
+    return;
+  }
+
+  if (daysSinceSync > 0) {
+    const incrementalFetchPlan = {
+      sourceStartPage: 1,
+      requestedSourcePages: INCREMENTAL_REFRESH_MAX_SOURCE_PAGES,
+    };
+    const shouldUseDateIncrement = daysSinceSync <= INCREMENTAL_REFRESH_MAX_DAYS;
+    const dateRange = shouldUseDateIncrement
+      ? {
+          from: nextCache.lastSyncDate,
+          to: todayDate,
+        }
+      : null;
+    const refreshFetchPlan = shouldUseDateIncrement ? incrementalFetchPlan : getRemotePaginationPlan(params);
+    const { records } = await collectCatalogRecords({
+      params,
+      tmdbGet,
+      todayDate,
+      fetchPlan: refreshFetchPlan,
+      sortKey: SORT_KEYS.DATE_DESC,
+      dateRange,
+    });
+
+    nextRecords = mergeCachedRecords(nextRecords, records);
+    nextCache = {
+      ...nextCache,
+      lastSyncDate: todayDate,
+      records: nextRecords,
+    };
+  }
+
+  if (daysSinceBackfill >= BACKFILL_INTERVAL_DAYS) {
+    const { records } = await collectCatalogRecords({
+      params,
+      tmdbGet,
+      todayDate,
+      fetchPlan: {
+        sourceStartPage: 1,
+        requestedSourcePages: INCREMENTAL_REFRESH_MAX_SOURCE_PAGES,
+      },
+      sortKey: SORT_KEYS.DATE_DESC,
+      dateRange: {
+        from: shiftDate(todayDate, -BACKFILL_LOOKBACK_DAYS),
+        to: todayDate,
+      },
+    });
+
+    nextCache = {
+      ...nextCache,
+      lastBackfillDate: todayDate,
+      records: mergeCachedRecords(nextRecords, records),
+    };
+  }
+
+  await writeCatalogCache(storage, nextCache);
 }
 
 function getLegacyCategoryValue(params = {}) {
@@ -1229,35 +1556,52 @@ function normalizeBrowseParams(params = {}) {
 
 async function browseCatalog(rawParams = {}, overrides = {}) {
   const params = normalizeBrowseParams(rawParams);
-  const tmdbGet = overrides.tmdbGet ?? getDefaultTmdbGet();
+  const storage = overrides.storage ?? getDefaultStorage();
   const todayDate = overrides.todayDate ?? getTodayDateString();
-  const fetchPlan = getRemotePaginationPlan(params);
-  const sourceMediaTypes = getCategoryMediaTypes(params.categoryId);
-  const selectedScopes = buildSelectedScopes(
-    params.categoryId,
-    sourceMediaTypes,
-    fetchPlan.sourceStartPage,
-    fetchPlan.requestedSourcePages,
-  );
+  const categoryTitle = getCategoryTitle(params.categoryId);
+  const cachedCatalog = await readCatalogCache(storage, params.categoryId);
 
-  if (!selectedScopes.length) {
-    throw new Error(`未知分类：${params.categoryId}`);
+  if (cachedCatalog?.records.length) {
+    if (!overrides.disableBackgroundRefresh) {
+      const tmdbGet = createTimeoutTmdbGet(
+        overrides.tmdbGet ?? getDefaultTmdbGet(),
+        overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
+      );
+      startBackgroundRefresh(
+        refreshCatalogCache({
+          params,
+          tmdbGet,
+          storage,
+          cache: cachedCatalog,
+          todayDate,
+        }),
+        overrides,
+      );
+    }
+
+    return mapRecordsToVideoItems(paginateCacheRecords(cachedCatalog.records, params, todayDate), categoryTitle);
   }
 
-  const scopeResults = await Promise.all(
-    selectedScopes.map((scope) =>
-      collectCatalogRecordsForScope({
-        params,
-        scope,
-        tmdbGet,
-        todayDate,
-      })),
+  const tmdbGet = createTimeoutTmdbGet(
+    overrides.tmdbGet ?? getDefaultTmdbGet(),
+    overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
   );
-
-  const records = dedupeCatalogRecords(scopeResults.flat());
+  const fetchPlan = getRemotePaginationPlan(params);
+  const { records } = await collectCatalogRecords({
+    params,
+    tmdbGet,
+    todayDate,
+    fetchPlan,
+  });
   const sortedRecords = sortCatalogRecords(records, params.sortKey);
   const pagedRecords = sortedRecords.slice(0, params.count);
-  const categoryTitle = selectedScopes[0].rule.title;
 
-  return pagedRecords.map((record) => mapRecordToVideoItem(record, categoryTitle));
+  if (storage && records.length) {
+    await writeCatalogCache(storage, {
+      ...createEmptyCache(params.categoryId, todayDate),
+      records: mergeCachedRecords([], records),
+    });
+  }
+
+  return mapRecordsToVideoItems(pagedRecords, categoryTitle);
 }
