@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.2",
+  version: "0.6.3",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -560,8 +560,8 @@ function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle 
   });
 }
 
-const CACHE_VERSION = 2;
-const CACHE_KEY_PREFIX = 'tmdb-category-browser:v2';
+const CACHE_VERSION = 3;
+const CACHE_KEY_PREFIX = 'tmdb-category-browser:v3';
 const CACHE_MAX_RECORDS = 1000;
 const TMDB_REQUEST_TIMEOUT_MS = 8000;
 const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
@@ -1312,6 +1312,7 @@ function createEmptyCache(categoryId, todayDate) {
     categoryId,
     lastSyncDate: todayDate,
     lastBackfillDate: '',
+    loadedPages: [],
     records: [],
   };
 }
@@ -1340,6 +1341,11 @@ function normalizeCache(rawCache, categoryId) {
     categoryId,
     lastSyncDate: normalizeTitle(rawCache.lastSyncDate),
     lastBackfillDate: normalizeTitle(rawCache.lastBackfillDate),
+    loadedPages: Array.isArray(rawCache.loadedPages)
+      ? rawCache.loadedPages
+          .map((value) => coerceInteger(value, 0, { min: 1 }))
+          .filter(Boolean)
+      : [],
     records: rawCache.records.filter(isValidCacheRecord),
   };
 }
@@ -1457,6 +1463,10 @@ function getCategoryTitle(categoryId) {
   return getRuleById(mediaType, categoryId)?.title ?? categoryId;
 }
 
+function addLoadedPage(cache, page) {
+  return Array.from(new Set([...(cache?.loadedPages ?? []), page])).sort((left, right) => left - right);
+}
+
 function startBackgroundRefresh(task, overrides) {
   const safeTask = task.catch(() => {});
   if (Array.isArray(overrides.backgroundTasks)) {
@@ -1560,8 +1570,12 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const todayDate = overrides.todayDate ?? getTodayDateString();
   const categoryTitle = getCategoryTitle(params.categoryId);
   const cachedCatalog = await readCatalogCache(storage, params.categoryId);
+  const cachedPageRecords = cachedCatalog?.records.length
+    ? paginateCacheRecords(cachedCatalog.records, params, todayDate)
+    : [];
+  const hasLoadedCurrentPage = cachedCatalog?.loadedPages.includes(params.page) === true;
 
-  if (cachedCatalog?.records.length) {
+  if (cachedCatalog?.records.length && cachedPageRecords.length && hasLoadedCurrentPage) {
     if (!overrides.disableBackgroundRefresh) {
       const tmdbGet = createTimeoutTmdbGet(
         overrides.tmdbGet ?? getDefaultTmdbGet(),
@@ -1579,7 +1593,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       );
     }
 
-    return mapRecordsToVideoItems(paginateCacheRecords(cachedCatalog.records, params, todayDate), categoryTitle);
+    return mapRecordsToVideoItems(cachedPageRecords, categoryTitle);
   }
 
   const tmdbGet = createTimeoutTmdbGet(
@@ -1597,10 +1611,17 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const pagedRecords = sortedRecords.slice(0, params.count);
 
   if (storage && records.length) {
+    const mergedRecords = mergeCachedRecords(cachedCatalog?.records ?? [], records);
     await writeCatalogCache(storage, {
-      ...createEmptyCache(params.categoryId, todayDate),
-      records: mergeCachedRecords([], records),
+      ...(cachedCatalog ?? createEmptyCache(params.categoryId, todayDate)),
+      lastSyncDate: todayDate,
+      loadedPages: addLoadedPage(cachedCatalog, params.page),
+      records: mergedRecords,
     });
+
+    if (cachedCatalog?.records.length) {
+      return mapRecordsToVideoItems(paginateCacheRecords(mergedRecords, params, todayDate), categoryTitle);
+    }
   }
 
   return mapRecordsToVideoItems(pagedRecords, categoryTitle);
