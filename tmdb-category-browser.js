@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.19",
+  version: "0.6.20",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -425,7 +425,7 @@ var WidgetMetadata = {
           title: '缓存版本',
           description: '内部缓存刷新标记，用于让 Forward 客户端丢弃旧模块结果缓存。',
           type: 'constant',
-          value: 'v0.6.19',
+          value: 'v0.6.20',
         },
         {
           name: 'sort_by',
@@ -568,15 +568,17 @@ function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle 
   });
 }
 
-const CACHE_VERSION = 6;
-const CACHE_KEY_PREFIX = 'tmdb-category-browser:v6';
+const CACHE_VERSION = 7;
+const CACHE_KEY_PREFIX = 'tmdb-category-browser:v7';
 const LEGACY_CACHE_KEY_PREFIXES = Object.freeze([
+  'tmdb-category-browser:v6',
   'tmdb-category-browser:v5',
   'tmdb-category-browser:v4',
 ]);
 const CACHE_MAX_RECORDS = 1000;
 const TMDB_REQUEST_TIMEOUT_MS = 8000;
 const CACHE_REFRESH_TIMEOUT_MS = 1500;
+const FIRST_PAGE_STALE_MAX_AGE_DAYS = 45;
 const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
 const INCREMENTAL_REFRESH_MAX_DAYS = 7;
 const BACKFILL_INTERVAL_DAYS = 7;
@@ -1705,6 +1707,28 @@ function getFirstRecordDateMs(records) {
   return getDateMs(records?.[0]?.releaseDate);
 }
 
+function isDateOlderThan(dateText, todayDate, maxAgeDays) {
+  const dateMs = getDateMs(dateText);
+  const todayMs = getDateMs(todayDate);
+  if (!Number.isFinite(dateMs) || !Number.isFinite(todayMs)) {
+    return false;
+  }
+
+  return todayMs - dateMs > maxAgeDays * 86400000;
+}
+
+function isCachedFirstPageTooOld(records, todayDate) {
+  return isDateOlderThan(records?.[0]?.releaseDate, todayDate, FIRST_PAGE_STALE_MAX_AGE_DAYS);
+}
+
+function shouldRefreshCachedFirstPage(cache, cachedRecords, params, todayDate) {
+  return (
+    cachedRecords.length > 0 &&
+    isFirstDateDescPage(params) &&
+    (!isCacheSyncedToday(cache, todayDate) || isCachedFirstPageTooOld(cachedRecords, todayDate))
+  );
+}
+
 function isRecordPoolNewerThanCachedPage(recordPoolPage, cachedPageRecords) {
   if (!recordPoolPage.length || !cachedPageRecords.length) {
     return false;
@@ -2074,12 +2098,11 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const cachedCatalog = await readCatalogCache(storage, params.categoryId);
   const cachedResponse = getCachedResponseRecords(cachedCatalog, params, todayDate);
 
-  if (
-    cachedResponse.records.length &&
-    isFirstDateDescPage(params) &&
-    !isCacheSyncedToday(cachedCatalog, todayDate)
-  ) {
-    const tmdbGet = createOptionalTimeoutTmdbGet(overrides, getCacheRefreshTimeoutMs(overrides));
+  if (shouldRefreshCachedFirstPage(cachedCatalog, cachedResponse.records, params, todayDate)) {
+    const refreshTimeoutMs = isCachedFirstPageTooOld(cachedResponse.records, todayDate)
+      ? (overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS)
+      : getCacheRefreshTimeoutMs(overrides);
+    const tmdbGet = createOptionalTimeoutTmdbGet(overrides, refreshTimeoutMs);
     if (tmdbGet) {
       try {
         const freshRecords = await fetchAndCacheCurrentWindow({
