@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.4",
+  version: "0.6.5",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -568,6 +568,8 @@ const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
 const INCREMENTAL_REFRESH_MAX_DAYS = 7;
 const BACKFILL_INTERVAL_DAYS = 7;
 const BACKFILL_LOOKBACK_DAYS = 90;
+const BACKGROUND_PREFETCH_PAGES = 1;
+const SOURCE_PAGE_BATCH_SIZE = 4;
 
 function buildImageUrl(size, path) {
   return isMeaningfulText(path) ? `${TMDB_IMAGE_BASE}/${size}${path}` : undefined;
@@ -1095,46 +1097,65 @@ async function collectCatalogRecordsForScope({
 
   // 这里刻意按“固定窗口”取页：当前 Forward 页只绑定一段 TMDb 远端页，
   // 不回扫历史页，也不为凑满数量继续补抓后续页。
-  for (let offset = 0; offset < scope.requestedSourcePages; offset += 1) {
-    const sourcePage = scope.startPage + offset;
+  // 同一窗口内按小批量并发抓取，避免一页一页串行等待导致冷启动过慢。
+  for (let offset = 0; offset < scope.requestedSourcePages;) {
+    const sourcePages = [];
 
-    if (Number.isFinite(knownTotalPages) && sourcePage > knownTotalPages) {
+    for (
+      let batchOffset = 0;
+      batchOffset < SOURCE_PAGE_BATCH_SIZE && offset < scope.requestedSourcePages;
+      batchOffset += 1, offset += 1
+    ) {
+      const sourcePage = scope.startPage + offset;
+      if (Number.isFinite(knownTotalPages) && sourcePage > knownTotalPages) {
+        break;
+      }
+
+      sourcePages.push(sourcePage);
+    }
+
+    if (!sourcePages.length) {
       break;
     }
 
-    const localizedPage = await fetchLocalizedDiscoverPage({
-      mediaType: scope.mediaType,
-      categoryId: params.categoryId,
-      rule: scope.rule,
-      sortKey,
-      sourcePage,
-      tmdbGet,
-      todayDate,
-      dateRange,
-    });
+    const localizedPages = await Promise.all(
+      sourcePages.map((sourcePage) =>
+        fetchLocalizedDiscoverPage({
+          mediaType: scope.mediaType,
+          categoryId: params.categoryId,
+          rule: scope.rule,
+          sortKey,
+          sourcePage,
+          tmdbGet,
+          todayDate,
+          dateRange,
+        })),
+    );
 
-    if (localizedPage.totalPages > 0) {
-      knownTotalPages = localizedPage.totalPages;
-    }
-
-    for (const record of localizedPage.results) {
-      // 过滤顺序固定：先看简/繁中文标题是否存在，再做业务过滤，最后才做分类命中判断。
-      const displayTitle = resolveCatalogDisplayTitle(record);
-      if (!displayTitle) {
-        continue;
+    for (const localizedPage of localizedPages) {
+      if (localizedPage.totalPages > 0) {
+        knownTotalPages = localizedPage.totalPages;
       }
 
-      if (!isAllowedRecord(record, todayDate, params.categoryId, sortKey)) {
-        continue;
-      }
+      for (const record of localizedPage.results) {
+        // 过滤顺序固定：先看简/繁中文标题是否存在，再做业务过滤，最后才做分类命中判断。
+        const displayTitle = resolveCatalogDisplayTitle(record);
+        if (!displayTitle) {
+          continue;
+        }
 
-      const matchedRule = classifyMediaRecord(scope.mediaType, record);
-      if (!matchedRule || matchedRule.id !== scope.rule.id) {
-        continue;
-      }
+        if (!isAllowedRecord(record, todayDate, params.categoryId, sortKey)) {
+          continue;
+        }
 
-      record.displayTitle = displayTitle;
-      collected.push(record);
+        const matchedRule = classifyMediaRecord(scope.mediaType, record);
+        if (!matchedRule || matchedRule.id !== scope.rule.id) {
+          continue;
+        }
+
+        record.displayTitle = displayTitle;
+        collected.push(record);
+      }
     }
   }
 
@@ -1507,10 +1528,107 @@ function setCachedPageRecords(cache, sortKey, page, records) {
   };
 }
 
+function getNearestCachedPageRecords(cache, params, todayDate) {
+  const pagesByNumber = cache?.pages?.[params.sortKey];
+  if (!pagesByNumber || typeof pagesByNumber !== 'object') {
+    return [];
+  }
+
+  const pageNumbers = Object.keys(pagesByNumber)
+    .map((page) => coerceInteger(page, 0, { min: 1 }))
+    .filter(Boolean)
+    .sort((left, right) => left - right);
+
+  if (!pageNumbers.length) {
+    return [];
+  }
+
+  const previousPage = pageNumbers.filter((page) => page <= params.page).at(-1);
+  const fallbackPage = previousPage ?? pageNumbers[0];
+  const fallbackRecords = pagesByNumber[String(fallbackPage)] ?? [];
+
+  return sortCatalogRecords(
+    filterRecordsForResponse(fallbackRecords, params, todayDate),
+    params.sortKey,
+  ).slice(0, params.count);
+}
+
+function getCachedFallbackRecords(cache, params, todayDate) {
+  const recordPoolPage = paginateCacheRecords(cache?.records ?? [], params, todayDate);
+  if (recordPoolPage.length) {
+    return recordPoolPage;
+  }
+
+  return getNearestCachedPageRecords(cache, params, todayDate);
+}
+
 function startBackgroundRefresh(task, overrides) {
   const safeTask = task.catch(() => {});
   if (Array.isArray(overrides.backgroundTasks)) {
     overrides.backgroundTasks.push(safeTask);
+  }
+}
+
+function createOptionalTimeoutTmdbGet(overrides) {
+  try {
+    return createTimeoutTmdbGet(
+      overrides.tmdbGet ?? getDefaultTmdbGet(),
+      overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function prefetchCatalogPage({ params, tmdbGet, storage, todayDate }) {
+  if (!storage || !tmdbGet) {
+    return;
+  }
+
+  const cachedCatalog = await readCatalogCache(storage, params.categoryId);
+  if (getCachedPageRecords(cachedCatalog, params.sortKey, params.page).length) {
+    return;
+  }
+
+  const { records } = await collectCatalogRecords({
+    params,
+    tmdbGet,
+    todayDate,
+    fetchPlan: getRemotePaginationPlan(params),
+  });
+  const sortedRecords = sortCatalogRecords(records, params.sortKey);
+  const pageRecords = sortedRecords.slice(0, params.count);
+
+  if (!pageRecords.length) {
+    return;
+  }
+
+  await writeCatalogCache(storage, {
+    ...(cachedCatalog ?? createEmptyCache(params.categoryId, todayDate)),
+    lastSyncDate: todayDate,
+    pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, pageRecords),
+    records: mergeCachedRecords(cachedCatalog?.records ?? [], records),
+  });
+}
+
+function startNextPagePrefetch({ params, tmdbGet, storage, todayDate, overrides }) {
+  if (overrides.disableBackgroundPrefetch) {
+    return;
+  }
+
+  for (let offset = 1; offset <= BACKGROUND_PREFETCH_PAGES; offset += 1) {
+    startBackgroundRefresh(
+      prefetchCatalogPage({
+        params: {
+          ...params,
+          page: params.page + offset,
+        },
+        tmdbGet,
+        storage,
+        todayDate,
+      }),
+      overrides,
+    );
   }
 }
 
@@ -1619,27 +1737,34 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     : [];
 
   if (cachedPageRecords.length) {
+    const tmdbGet = createOptionalTimeoutTmdbGet(overrides);
     if (!overrides.disableBackgroundRefresh) {
-      const tmdbGet = createTimeoutTmdbGet(
-        overrides.tmdbGet ?? getDefaultTmdbGet(),
-        overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
-      );
-      startBackgroundRefresh(
-        refreshCatalogCache({
-          params,
-          tmdbGet,
-          storage,
-          cache: cachedCatalog,
-          todayDate,
-        }),
-        overrides,
-      );
+      if (tmdbGet) {
+        startBackgroundRefresh(
+          refreshCatalogCache({
+            params,
+            tmdbGet,
+            storage,
+            cache: cachedCatalog,
+            todayDate,
+          }),
+          overrides,
+        );
+      }
     }
+    startNextPagePrefetch({ params, tmdbGet, storage, todayDate, overrides });
 
     return mapRecordsToVideoItems(cachedPageRecords, categoryTitle);
   }
 
   if (cachedRecordPoolPage.length) {
+    startNextPagePrefetch({
+      params,
+      tmdbGet: createOptionalTimeoutTmdbGet(overrides),
+      storage,
+      todayDate,
+      overrides,
+    });
     return mapRecordsToVideoItems(cachedRecordPoolPage, categoryTitle);
   }
 
@@ -1657,6 +1782,13 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const sortedRecords = sortCatalogRecords(records, params.sortKey);
   const pagedRecords = sortedRecords.slice(0, params.count);
 
+  if (!pagedRecords.length) {
+    const fallbackRecords = getCachedFallbackRecords(cachedCatalog, params, todayDate);
+    if (fallbackRecords.length) {
+      return mapRecordsToVideoItems(fallbackRecords, categoryTitle);
+    }
+  }
+
   if (storage && records.length) {
     const mergedRecords = mergeCachedRecords(cachedCatalog?.records ?? [], records);
     await writeCatalogCache(storage, {
@@ -1665,6 +1797,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, pagedRecords),
       records: mergedRecords,
     });
+    startNextPagePrefetch({ params, tmdbGet, storage, todayDate, overrides });
   }
 
   return mapRecordsToVideoItems(pagedRecords, categoryTitle);
