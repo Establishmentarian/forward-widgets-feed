@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.14",
+  version: "0.6.15",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -566,11 +566,12 @@ const CACHE_KEY_PREFIX = 'tmdb-category-browser:v5';
 const LEGACY_CACHE_KEY_PREFIXES = Object.freeze(['tmdb-category-browser:v4']);
 const CACHE_MAX_RECORDS = 1000;
 const TMDB_REQUEST_TIMEOUT_MS = 8000;
+const CACHE_REFRESH_TIMEOUT_MS = 1500;
 const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
 const INCREMENTAL_REFRESH_MAX_DAYS = 7;
 const BACKFILL_INTERVAL_DAYS = 7;
 const BACKFILL_LOOKBACK_DAYS = 90;
-const BACKGROUND_PREFETCH_PAGES = 1;
+const BACKGROUND_PREFETCH_PAGES = 0;
 const SOURCE_PAGE_BATCH_SIZE = 4;
 
 function buildImageUrl(size, path) {
@@ -1635,6 +1636,33 @@ function paginateCacheRecords(records, params, todayDate) {
   return sortedRecords.slice(startIndex, startIndex + params.count);
 }
 
+function getCachePageLimit(params) {
+  // Forward 的分类入口预览可能用 count=1 请求同一个 page=1。
+  // 页缓存没有单独按 count 分桶，所以写缓存时至少保留默认一页，
+  // 避免一次预览请求把真正海报墙第一页污染成只有 1 张。
+  return Math.max(params.count, DEFAULT_COUNT);
+}
+
+function sliceCurrentWindowRecords(records, params) {
+  return sortCatalogRecords(records, params.sortKey).slice(0, getCachePageLimit(params));
+}
+
+async function fetchCurrentWindowRecords({ params, tmdbGet, todayDate }) {
+  const { records } = await collectCatalogRecords({
+    params,
+    tmdbGet,
+    todayDate,
+    fetchPlan: getRemotePaginationPlan(params),
+  });
+  const sortedRecords = sortCatalogRecords(records, params.sortKey);
+
+  return {
+    records,
+    responseRecords: sortedRecords.slice(0, params.count),
+    cachePageRecords: sliceCurrentWindowRecords(records, params),
+  };
+}
+
 function mapRecordsToVideoItems(records, categoryTitle) {
   return records
     .filter(hasRenderablePoster)
@@ -1649,6 +1677,70 @@ function getCategoryTitle(categoryId) {
 function getCachedPageRecords(cache, sortKey, page) {
   const records = cache?.pages?.[sortKey]?.[String(page)];
   return normalizeCacheRecords(records);
+}
+
+function isFirstDateDescPage(params) {
+  return params.sortKey === SORT_KEYS.DATE_DESC && params.page === 1;
+}
+
+function isPreviewPageRequest(params) {
+  return params.page === 1 && params.count === 1;
+}
+
+function isCacheSyncedToday(cache, todayDate) {
+  return normalizeTitle(cache?.lastSyncDate) === todayDate;
+}
+
+function getFirstRecordDateMs(records) {
+  return getDateMs(records?.[0]?.releaseDate);
+}
+
+function isRecordPoolNewerThanCachedPage(recordPoolPage, cachedPageRecords) {
+  if (!recordPoolPage.length || !cachedPageRecords.length) {
+    return false;
+  }
+
+  const recordPoolDateMs = getFirstRecordDateMs(recordPoolPage);
+  const cachedPageDateMs = getFirstRecordDateMs(cachedPageRecords);
+
+  return (
+    Number.isFinite(recordPoolDateMs) &&
+    (!Number.isFinite(cachedPageDateMs) || recordPoolDateMs > cachedPageDateMs)
+  );
+}
+
+function getCachedResponseRecords(cache, params, todayDate) {
+  const cachedPageRecords = sortCatalogRecords(
+    filterRecordsForResponse(getCachedPageRecords(cache, params.sortKey, params.page), params, todayDate),
+    params.sortKey,
+  ).slice(0, params.count);
+  const recordPoolPage = paginateCacheRecords(cache?.records ?? [], params, todayDate);
+
+  if (isFirstDateDescPage(params) && isRecordPoolNewerThanCachedPage(recordPoolPage, cachedPageRecords)) {
+    return {
+      records: recordPoolPage,
+      shouldRepairPageCache: true,
+    };
+  }
+
+  if (cachedPageRecords.length) {
+    return {
+      records: cachedPageRecords,
+      shouldRepairPageCache: false,
+    };
+  }
+
+  if ((isPreviewPageRequest(params) || canUseCachedRecordPool(cache, params)) && recordPoolPage.length) {
+    return {
+      records: recordPoolPage,
+      shouldRepairPageCache: false,
+    };
+  }
+
+  return {
+    records: [],
+    shouldRepairPageCache: false,
+  };
 }
 
 function getSequentialCachedPageCount(cache, sortKey) {
@@ -1732,15 +1824,94 @@ function startBackgroundRefresh(task, overrides) {
   }
 }
 
-function createOptionalTimeoutTmdbGet(overrides) {
+function createOptionalTimeoutTmdbGet(overrides, timeoutMs = overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS) {
   try {
     return createTimeoutTmdbGet(
       overrides.tmdbGet ?? getDefaultTmdbGet(),
-      overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
+      timeoutMs,
     );
   } catch {
     return null;
   }
+}
+
+function getCacheRefreshTimeoutMs(overrides) {
+  return overrides.cacheRefreshTimeoutMs ?? Math.min(
+    overrides.tmdbTimeoutMs ?? CACHE_REFRESH_TIMEOUT_MS,
+    CACHE_REFRESH_TIMEOUT_MS,
+  );
+}
+
+function withDateDescFirstPageFromRecords(cache, params, todayDate, records) {
+  const pageRecords = paginateCacheRecords(
+    records,
+    {
+      ...params,
+      sortKey: SORT_KEYS.DATE_DESC,
+      page: 1,
+      count: getCachePageLimit(params),
+    },
+    todayDate,
+  );
+
+  if (!pageRecords.length) {
+    return cache;
+  }
+
+  return {
+    ...cache,
+    pages: setCachedPageRecords(cache, SORT_KEYS.DATE_DESC, 1, pageRecords),
+  };
+}
+
+async function repairCachedPageFromRecords({ storage, cache, params, records }) {
+  if (!storage || !cache || !records.length) {
+    return;
+  }
+
+  await writeCatalogCache(storage, {
+    ...cache,
+    pages: setCachedPageRecords(cache, params.sortKey, params.page, records),
+  });
+}
+
+async function fetchAndCacheCurrentWindow({ params, tmdbGet, storage, cache, todayDate }) {
+  const { records, responseRecords, cachePageRecords } = await fetchCurrentWindowRecords({
+    params,
+    tmdbGet,
+    todayDate,
+  });
+
+  if (!records.length) {
+    return responseRecords;
+  }
+
+  const baseCache = cache ?? createEmptyCache(params.categoryId, todayDate);
+  const mergedRecords = mergeCachedRecords(baseCache.records ?? [], records);
+  const responsePageRecords = isFirstDateDescPage(params)
+    ? paginateCacheRecords(mergedRecords, params, todayDate)
+    : responseRecords;
+  const pageRecords = isFirstDateDescPage(params)
+    ? paginateCacheRecords(
+      mergedRecords,
+      {
+        ...params,
+        count: getCachePageLimit(params),
+      },
+      todayDate,
+    )
+    : cachePageRecords;
+
+  if (storage && pageRecords.length) {
+    await writeCatalogCache(storage, {
+      ...baseCache,
+      lastSyncDate: todayDate,
+      pages: setCachedPageRecords(baseCache, params.sortKey, params.page, pageRecords),
+      records: mergedRecords,
+    });
+  }
+
+  return responsePageRecords;
 }
 
 async function prefetchCatalogPage({ params, tmdbGet, storage, todayDate }) {
@@ -1753,23 +1924,20 @@ async function prefetchCatalogPage({ params, tmdbGet, storage, todayDate }) {
     return;
   }
 
-  const { records } = await collectCatalogRecords({
+  const { records, cachePageRecords } = await fetchCurrentWindowRecords({
     params,
     tmdbGet,
     todayDate,
-    fetchPlan: getRemotePaginationPlan(params),
   });
-  const sortedRecords = sortCatalogRecords(records, params.sortKey);
-  const pageRecords = sortedRecords.slice(0, params.count);
 
-  if (!pageRecords.length) {
+  if (!cachePageRecords.length) {
     return;
   }
 
   await writeCatalogCache(storage, {
     ...(cachedCatalog ?? createEmptyCache(params.categoryId, todayDate)),
     lastSyncDate: todayDate,
-    pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, pageRecords),
+    pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, cachePageRecords),
     records: mergeCachedRecords(cachedCatalog?.records ?? [], records),
   });
 }
@@ -1833,6 +2001,7 @@ async function refreshCatalogCache({ params, tmdbGet, storage, cache, todayDate 
       lastSyncDate: todayDate,
       records: nextRecords,
     };
+    nextCache = withDateDescFirstPageFromRecords(nextCache, params, todayDate, nextRecords);
   }
 
   if (daysSinceBackfill >= BACKFILL_INTERVAL_DAYS) {
@@ -1851,11 +2020,13 @@ async function refreshCatalogCache({ params, tmdbGet, storage, cache, todayDate 
       },
     });
 
+    nextRecords = mergeCachedRecords(nextRecords, records);
     nextCache = {
       ...nextCache,
       lastBackfillDate: todayDate,
-      records: mergeCachedRecords(nextRecords, records),
+      records: nextRecords,
     };
+    nextCache = withDateDescFirstPageFromRecords(nextCache, params, todayDate, nextRecords);
   }
 
   await writeCatalogCache(storage, nextCache);
@@ -1891,15 +2062,43 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const todayDate = overrides.todayDate ?? getTodayDateString();
   const categoryTitle = getCategoryTitle(params.categoryId);
   const cachedCatalog = await readCatalogCache(storage, params.categoryId);
-  const cachedPageRecords = sortCatalogRecords(
-    filterRecordsForResponse(getCachedPageRecords(cachedCatalog, params.sortKey, params.page), params, todayDate),
-    params.sortKey,
-  ).slice(0, params.count);
-  const cachedRecordPoolPage = canUseCachedRecordPool(cachedCatalog, params)
-    ? paginateCacheRecords(cachedCatalog.records, params, todayDate)
-    : [];
+  const cachedResponse = getCachedResponseRecords(cachedCatalog, params, todayDate);
 
-  if (cachedPageRecords.length) {
+  if (
+    cachedResponse.records.length &&
+    isFirstDateDescPage(params) &&
+    !isCacheSyncedToday(cachedCatalog, todayDate)
+  ) {
+    const tmdbGet = createOptionalTimeoutTmdbGet(overrides, getCacheRefreshTimeoutMs(overrides));
+    if (tmdbGet) {
+      try {
+        const freshRecords = await fetchAndCacheCurrentWindow({
+          params,
+          tmdbGet,
+          storage,
+          cache: cachedCatalog,
+          todayDate,
+        });
+
+        if (freshRecords.length) {
+          return mapRecordsToVideoItems(freshRecords, categoryTitle);
+        }
+      } catch {
+        // 首页新鲜度刷新是“尽力而为”：失败时继续返回已有缓存，避免刷新后白屏。
+      }
+    }
+  }
+
+  if (cachedResponse.records.length) {
+    if (cachedResponse.shouldRepairPageCache) {
+      await repairCachedPageFromRecords({
+        storage,
+        cache: cachedCatalog,
+        params,
+        records: cachedResponse.records,
+      });
+    }
+
     const tmdbGet = createOptionalTimeoutTmdbGet(overrides);
     if (!overrides.disableBackgroundRefresh) {
       if (tmdbGet) {
@@ -1917,35 +2116,20 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     }
     startNextPagePrefetch({ params, tmdbGet, storage, todayDate, overrides });
 
-    return mapRecordsToVideoItems(cachedPageRecords, categoryTitle);
-  }
-
-  if (cachedRecordPoolPage.length) {
-    startNextPagePrefetch({
-      params,
-      tmdbGet: createOptionalTimeoutTmdbGet(overrides),
-      storage,
-      todayDate,
-      overrides,
-    });
-    return mapRecordsToVideoItems(cachedRecordPoolPage, categoryTitle);
+    return mapRecordsToVideoItems(cachedResponse.records, categoryTitle);
   }
 
   const tmdbGet = createTimeoutTmdbGet(
     overrides.tmdbGet ?? getDefaultTmdbGet(),
     overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
   );
-  const fetchPlan = getRemotePaginationPlan(params);
-  const { records } = await collectCatalogRecords({
+  const { records, responseRecords, cachePageRecords } = await fetchCurrentWindowRecords({
     params,
     tmdbGet,
     todayDate,
-    fetchPlan,
   });
-  const sortedRecords = sortCatalogRecords(records, params.sortKey);
-  const pagedRecords = sortedRecords.slice(0, params.count);
 
-  if (!pagedRecords.length) {
+  if (!responseRecords.length) {
     let fallbackRecords = getCachedFallbackRecords(cachedCatalog, params, todayDate);
     if (!fallbackRecords.length) {
       const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId);
@@ -1962,10 +2146,10 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     await writeCatalogCache(storage, {
       ...(cachedCatalog ?? createEmptyCache(params.categoryId, todayDate)),
       lastSyncDate: todayDate,
-      pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, pagedRecords),
+      pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, cachePageRecords),
       records: mergedRecords,
     });
   }
 
-  return mapRecordsToVideoItems(pagedRecords, categoryTitle);
+  return mapRecordsToVideoItems(responseRecords, categoryTitle);
 }
