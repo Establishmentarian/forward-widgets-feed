@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.18",
+  version: "0.6.19",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -418,8 +418,15 @@ var WidgetMetadata = {
       description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
       functionName: 'browseTmdbCategories',
       type: 'video',
-      cacheDuration: 0,
+      cacheDuration: 1,
       params: [
+        {
+          name: 'cache_rev',
+          title: '缓存版本',
+          description: '内部缓存刷新标记，用于让 Forward 客户端丢弃旧模块结果缓存。',
+          type: 'constant',
+          value: 'v0.6.19',
+        },
         {
           name: 'sort_by',
           title: '排序方式',
