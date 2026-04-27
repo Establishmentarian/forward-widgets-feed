@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.11",
+  version: "0.6.12",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -417,6 +417,7 @@ var WidgetMetadata = {
       title: '影视分类',
       description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
       functionName: 'browseTmdbCategories',
+      type: 'video',
       cacheDuration: 3600,
       params: [
         {
@@ -572,7 +573,7 @@ const BACKGROUND_PREFETCH_PAGES = 1;
 const SOURCE_PAGE_BATCH_SIZE = 4;
 
 function buildImageUrl(size, path) {
-  return isMeaningfulText(path) ? `${TMDB_IMAGE_BASE}/${size}${path}` : undefined;
+  return isMeaningfulText(path) ? `${TMDB_IMAGE_BASE}/${size}${path}` : '';
 }
 
 function getRawTitle(item, mediaType) {
@@ -1341,32 +1342,139 @@ function createEmptyCache(categoryId, todayDate) {
   };
 }
 
+function normalizeTmdbIdentity(record) {
+  if (!record || typeof record !== 'object') {
+    return null;
+  }
+
+  const explicitMediaType = record.mediaType === MEDIA_TYPES.MOVIE || record.mediaType === MEDIA_TYPES.TV
+    ? record.mediaType
+    : '';
+  const candidates = [record.tmdbId, record.id];
+  let parsedMediaType = '';
+  let parsedTmdbId = NaN;
+
+  for (const value of candidates) {
+    if (Number.isFinite(value)) {
+      parsedTmdbId = value;
+      break;
+    }
+
+    const text = normalizeTitle(value);
+    const prefixedMatch = /^(movie|tv)\.(\d+)$/i.exec(text);
+    if (prefixedMatch) {
+      parsedMediaType = prefixedMatch[1].toLowerCase();
+      parsedTmdbId = Number.parseInt(prefixedMatch[2], 10);
+      break;
+    }
+
+    if (/^\d+$/.test(text)) {
+      parsedTmdbId = Number.parseInt(text, 10);
+      break;
+    }
+  }
+
+  const mediaType = explicitMediaType || parsedMediaType;
+  if (!Number.isFinite(parsedTmdbId) || parsedTmdbId <= 0 || !mediaType) {
+    return null;
+  }
+
+  return {
+    tmdbId: parsedTmdbId,
+    mediaType,
+  };
+}
+
+function normalizeNumber(value, fallback = 0) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : fallback;
+}
+
+function normalizeStringArray(value) {
+  return Array.isArray(value)
+    ? value.map((item) => normalizeTitle(item)).filter(Boolean)
+    : [];
+}
+
+function normalizeNumberArray(value) {
+  return Array.isArray(value)
+    ? value.map((item) => Number(item)).filter(Number.isFinite)
+    : [];
+}
+
+function hasRenderablePoster(record) {
+  return isMeaningfulText(record?.posterPath);
+}
+
+function normalizeCacheRecord(record) {
+  const identity = normalizeTmdbIdentity(record);
+  if (!identity) {
+    return null;
+  }
+
+  const normalizedRecord = {
+    ...record,
+    tmdbId: identity.tmdbId,
+    mediaType: identity.mediaType,
+    displayTitle: normalizeTitle(record.displayTitle || record.title || record.name),
+    simplifiedTitle: normalizeTitle(record.simplifiedTitle),
+    traditionalTitle: normalizeTitle(record.traditionalTitle),
+    originalTitle: normalizeTitle(record.originalTitle),
+    overview: normalizeTitle(record.overview || record.description),
+    genreIds: normalizeNumberArray(record.genreIds),
+    originalLanguage: normalizeTitle(record.originalLanguage).toLowerCase(),
+    originCountry: normalizeStringArray(record.originCountry).map((value) => value.toUpperCase()),
+    releaseDate: normalizeTitle(record.releaseDate),
+    adult: record.adult === true,
+    voteCount: normalizeNumber(record.voteCount),
+    voteAverage: normalizeNumber(record.voteAverage),
+    posterPath: normalizeTitle(record.posterPath || record.poster_path),
+    backdropPath: normalizeTitle(record.backdropPath || record.backdrop_path),
+  };
+
+  return isValidCacheRecord(normalizedRecord) ? normalizedRecord : null;
+}
+
+function normalizeCacheRecords(records) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+
+  return records
+    .map((record) => normalizeCacheRecord(record))
+    .filter(Boolean);
+}
+
 function isValidCacheRecord(record) {
   return (
     record &&
     Number.isFinite(record.tmdbId) &&
     (record.mediaType === MEDIA_TYPES.MOVIE || record.mediaType === MEDIA_TYPES.TV) &&
-    isMeaningfulText(record.displayTitle)
+    isMeaningfulText(record.displayTitle) &&
+    hasRenderablePoster(record)
   );
 }
 
 function normalizeCache(rawCache, categoryId) {
   if (
     !rawCache ||
-    rawCache.version !== CACHE_VERSION ||
-    rawCache.categoryId !== categoryId ||
-    !Array.isArray(rawCache.records)
+    (rawCache.categoryId && rawCache.categoryId !== categoryId)
   ) {
     return null;
   }
+
+  const pages = normalizeCachedPages(rawCache.pages);
+  const pageRecords = Object.values(pages)
+    .flatMap((pagesByNumber) => Object.values(pagesByNumber))
+    .flat();
 
   return {
     version: CACHE_VERSION,
     categoryId,
     lastSyncDate: normalizeTitle(rawCache.lastSyncDate),
     lastBackfillDate: normalizeTitle(rawCache.lastBackfillDate),
-    pages: normalizeCachedPages(rawCache.pages),
-    records: rawCache.records.filter(isValidCacheRecord),
+    pages,
+    records: mergeCachedRecords(normalizeCacheRecords(rawCache.records), pageRecords),
   };
 }
 
@@ -1389,7 +1497,7 @@ function normalizeCachedPages(rawPages) {
         continue;
       }
 
-      const normalizedRecords = records.filter(isValidCacheRecord);
+      const normalizedRecords = normalizeCacheRecords(records);
       if (normalizedRecords.length) {
         normalizedPagesByNumber[String(pageNumber)] = normalizedRecords;
       }
@@ -1435,14 +1543,16 @@ async function writeCatalogCache(storage, cache) {
 function mergeCachedRecords(existingRecords = [], incomingRecords = []) {
   const mergedByKey = new Map();
 
-  for (const record of existingRecords) {
-    if (isValidCacheRecord(record)) {
+  for (const rawRecord of existingRecords) {
+    const record = normalizeCacheRecord(rawRecord);
+    if (record) {
       mergedByKey.set(`${record.mediaType}:${record.tmdbId}`, record);
     }
   }
 
-  for (const record of incomingRecords) {
-    if (isValidCacheRecord(record)) {
+  for (const rawRecord of incomingRecords) {
+    const record = normalizeCacheRecord(rawRecord);
+    if (record) {
       mergedByKey.set(`${record.mediaType}:${record.tmdbId}`, record);
     }
   }
@@ -1497,7 +1607,9 @@ function createTimeoutTmdbGet(tmdbGet, timeoutMs = TMDB_REQUEST_TIMEOUT_MS) {
 }
 
 function filterRecordsForResponse(records, params, todayDate) {
-  return records.filter((record) => isAllowedRecord(record, todayDate, params.categoryId, params.sortKey));
+  return records.filter((record) =>
+    hasRenderablePoster(record) &&
+    isAllowedRecord(record, todayDate, params.categoryId, params.sortKey));
 }
 
 function paginateCacheRecords(records, params, todayDate) {
@@ -1508,7 +1620,9 @@ function paginateCacheRecords(records, params, todayDate) {
 }
 
 function mapRecordsToVideoItems(records, categoryTitle) {
-  return records.map((record) => mapRecordToVideoItem(record, categoryTitle));
+  return records
+    .filter(hasRenderablePoster)
+    .map((record) => mapRecordToVideoItem(record, categoryTitle));
 }
 
 function getCategoryTitle(categoryId) {
@@ -1518,7 +1632,7 @@ function getCategoryTitle(categoryId) {
 
 function getCachedPageRecords(cache, sortKey, page) {
   const records = cache?.pages?.[sortKey]?.[String(page)];
-  return Array.isArray(records) ? records.filter(isValidCacheRecord) : [];
+  return normalizeCacheRecords(records);
 }
 
 function setCachedPageRecords(cache, sortKey, page, records) {
@@ -1526,7 +1640,7 @@ function setCachedPageRecords(cache, sortKey, page, records) {
     ...(cache?.pages ?? {}),
     [sortKey]: {
       ...(cache?.pages?.[sortKey] ?? {}),
-      [String(page)]: records.filter(isValidCacheRecord),
+      [String(page)]: normalizeCacheRecords(records),
     },
   };
 }
@@ -1735,7 +1849,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     filterRecordsForResponse(getCachedPageRecords(cachedCatalog, params.sortKey, params.page), params, todayDate),
     params.sortKey,
   ).slice(0, params.count);
-  const cachedRecordPoolPage = params.page === 1 && cachedCatalog?.records.length
+  const cachedRecordPoolPage = cachedCatalog?.records.length
     ? paginateCacheRecords(cachedCatalog.records, params, todayDate)
     : [];
 
@@ -1800,7 +1914,6 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, pagedRecords),
       records: mergedRecords,
     });
-    startNextPagePrefetch({ params, tmdbGet, storage, todayDate, overrides });
   }
 
   return mapRecordsToVideoItems(pagedRecords, categoryTitle);
