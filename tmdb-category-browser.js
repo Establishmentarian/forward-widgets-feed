@@ -37,21 +37,11 @@ const CATALOG_SOURCE_PAGE_MULTIPLIERS = Object.freeze({
 const MIN_DISCOVER_VOTE_COUNT = Object.freeze({
   default: 1,
   rating: 5,
-  strictForeignDate: 3,
 });
 
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const TMDB_LANGUAGE_SIMPLIFIED = 'zh-CN';
 const TMDB_LANGUAGE_TRADITIONAL = 'zh-TW';
-
-const STRICT_FOREIGN_CATEGORY_IDS = Object.freeze([
-  'western_movie',
-  'western_series',
-  'asia_pacific_movie',
-  'asia_pacific_series',
-  'documentary',
-  'concert',
-]);
 
 const CONCERT_KEYWORDS = Object.freeze([
   '演唱会',
@@ -408,7 +398,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.12",
+  version: "0.6.13",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -561,8 +551,9 @@ function resolveDisplayTitle({ simplifiedTitle, traditionalTitle, originalTitle 
   });
 }
 
-const CACHE_VERSION = 4;
-const CACHE_KEY_PREFIX = 'tmdb-category-browser:v4';
+const CACHE_VERSION = 5;
+const CACHE_KEY_PREFIX = 'tmdb-category-browser:v5';
+const LEGACY_CACHE_KEY_PREFIXES = Object.freeze(['tmdb-category-browser:v4']);
 const CACHE_MAX_RECORDS = 1000;
 const TMDB_REQUEST_TIMEOUT_MS = 8000;
 const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
@@ -843,13 +834,9 @@ function buildGenreText(genreIds, mediaType) {
   return genres.join(' / ');
 }
 
-function getMinimumVoteCount(categoryId, sortKey) {
+function getMinimumVoteCount(sortKey) {
   if (sortKey === SORT_KEYS.RATING_ASC || sortKey === SORT_KEYS.RATING_DESC) {
     return MIN_DISCOVER_VOTE_COUNT.rating;
-  }
-
-  if (STRICT_FOREIGN_CATEGORY_IDS.includes(categoryId)) {
-    return MIN_DISCOVER_VOTE_COUNT.strictForeignDate;
   }
 
   return MIN_DISCOVER_VOTE_COUNT.default;
@@ -898,7 +885,7 @@ function buildDiscoverParams(mediaType, categoryId, rule, sortKey, sourcePage, t
     include_adult: false,
     page: sourcePage,
     sort_by: getTmdbSortBy(mediaType, sortKey),
-    'vote_count.gte': getMinimumVoteCount(categoryId, sortKey),
+    'vote_count.gte': getMinimumVoteCount(sortKey),
     'vote_average.gte': 0.1,
     ...buildRuleDiscoverParams(rule),
   };
@@ -1048,7 +1035,7 @@ function isAllowedRecord(record, todayDate, categoryId, sortKey) {
     return false;
   }
 
-  if (!Number.isFinite(record.voteCount) || record.voteCount < getMinimumVoteCount(categoryId, sortKey)) {
+  if (!Number.isFinite(record.voteCount) || record.voteCount < getMinimumVoteCount(sortKey)) {
     return false;
   }
 
@@ -1319,8 +1306,8 @@ function mapRecordToVideoItem(record, categoryTitle) {
   };
 }
 
-function getCatalogCacheKey(categoryId) {
-  return `${CACHE_KEY_PREFIX}:${categoryId}`;
+function getCatalogCacheKey(categoryId, keyPrefix = CACHE_KEY_PREFIX) {
+  return `${keyPrefix}:${categoryId}`;
 }
 
 function getDefaultStorage() {
@@ -1455,9 +1442,10 @@ function isValidCacheRecord(record) {
   );
 }
 
-function normalizeCache(rawCache, categoryId) {
+function normalizeCache(rawCache, categoryId, { allowLegacy = false } = {}) {
   if (
     !rawCache ||
+    (!allowLegacy && rawCache.version !== CACHE_VERSION) ||
     (rawCache.categoryId && rawCache.categoryId !== categoryId)
   ) {
     return null;
@@ -1511,21 +1499,35 @@ function normalizeCachedPages(rawPages) {
   return pages;
 }
 
-async function readCatalogCache(storage, categoryId) {
+async function readCatalogCache(storage, categoryId, { keyPrefix = CACHE_KEY_PREFIX, allowLegacy = false } = {}) {
   if (!storage?.get) {
     return null;
   }
 
   try {
-    const rawValue = await storage.get(getCatalogCacheKey(categoryId));
+    const rawValue = await storage.get(getCatalogCacheKey(categoryId, keyPrefix));
     if (!rawValue) {
       return null;
     }
 
-    return normalizeCache(JSON.parse(rawValue), categoryId);
+    return normalizeCache(JSON.parse(rawValue), categoryId, { allowLegacy });
   } catch {
     return null;
   }
+}
+
+async function readLegacyCatalogCache(storage, categoryId) {
+  for (const keyPrefix of LEGACY_CACHE_KEY_PREFIXES) {
+    const cache = await readCatalogCache(storage, categoryId, {
+      keyPrefix,
+      allowLegacy: true,
+    });
+    if (cache?.records.length || Object.keys(cache?.pages ?? {}).length) {
+      return cache;
+    }
+  }
+
+  return null;
 }
 
 async function writeCatalogCache(storage, cache) {
@@ -1900,7 +1902,12 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const pagedRecords = sortedRecords.slice(0, params.count);
 
   if (!pagedRecords.length) {
-    const fallbackRecords = getCachedFallbackRecords(cachedCatalog, params, todayDate);
+    let fallbackRecords = getCachedFallbackRecords(cachedCatalog, params, todayDate);
+    if (!fallbackRecords.length) {
+      const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId);
+      fallbackRecords = getCachedFallbackRecords(legacyCachedCatalog, params, todayDate);
+    }
+
     if (fallbackRecords.length) {
       return mapRecordsToVideoItems(fallbackRecords, categoryTitle);
     }
