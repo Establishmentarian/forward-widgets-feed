@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.6",
+  version: "0.6.7",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -1301,17 +1301,17 @@ function mapRecordToVideoItem(record, categoryTitle) {
   const tmdbId = String(record.tmdbId);
 
   return {
-    id: `${record.mediaType}.${tmdbId}`,
-    // Forward 相关 URL Scheme 和弹幕/详情参数都按字符串传递 TMDb ID。
-    // 这里不要保留数字，避免宿主侧用 tmdbId 字段二次识别时发生类型不匹配。
-    tmdbId,
+    // Forward 实际原生 TMDb 卡片识别使用“纯 TMDb ID + mediaType”。
+    // 如果把 id 写成 movie.123/tv.123 或额外提供 link，宿主可能走到
+    // 自定义详情链路，导致点开后提示“未获取到视频数据”。
+    id: tmdbId,
+    tmdbId: Number(record.tmdbId),
     type: 'tmdb',
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
     posterPath: record.posterPath,
     backdropPath: record.backdropPath,
     releaseDate: record.releaseDate || undefined,
     mediaType: record.mediaType,
-    link: `forward://tmdb?id=${encodeURIComponent(tmdbId)}&type=${encodeURIComponent(record.mediaType)}`,
     genreTitle: buildGenreText(record.genreIds, record.mediaType),
     description: buildDescription(record, categoryTitle),
   };
