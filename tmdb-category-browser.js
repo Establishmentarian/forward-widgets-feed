@@ -408,7 +408,7 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.5",
+  version: "0.6.6",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
@@ -1302,7 +1302,9 @@ function mapRecordToVideoItem(record, categoryTitle) {
 
   return {
     id: `${record.mediaType}.${tmdbId}`,
-    tmdbId: record.tmdbId,
+    // Forward 相关 URL Scheme 和弹幕/详情参数都按字符串传递 TMDb ID。
+    // 这里不要保留数字，避免宿主侧用 tmdbId 字段二次识别时发生类型不匹配。
+    tmdbId,
     type: 'tmdb',
     title: record.displayTitle || record.originalTitle || `${record.mediaType}-${record.tmdbId}`,
     posterPath: record.posterPath,
