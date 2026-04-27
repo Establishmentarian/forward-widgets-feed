@@ -408,17 +408,17 @@ var WidgetMetadata = {
   id: 'tmdb-category-browser',
   title: 'TMDb 剧集/电影分类',
   description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.16",
+  version: "0.6.17",
   requiredVersion: '0.0.1',
   author: 'Codex',
   modules: [
     {
-      id: 'tmdb-category-browser',
+      id: 'tmdb-category-browser-v2',
       title: '影视分类',
       description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
-      functionName: 'browseTmdbCategories',
+      functionName: 'browseTmdbCategoriesV2',
       type: 'video',
-      cacheDuration: 3600,
+      cacheDuration: 0,
       params: [
         {
           name: 'sort_by',
@@ -470,8 +470,13 @@ var WidgetMetadata = {
 };
 
 // 视频卡片统一走 Forward 原生 TMDb 链路，不再经过 Worker 目录代理或自定义详情封装。
-async function browseTmdbCategories(params) {
+async function browseTmdbCategoriesV2(params) {
   return browseCatalog(params);
+}
+
+// 保留旧函数名，避免部分 Forward 客户端在订阅元数据刷新前调用旧入口时报错。
+async function browseTmdbCategories(params) {
+  return browseTmdbCategoriesV2(params);
 }
 
 function getDefaultTmdbGet() {
