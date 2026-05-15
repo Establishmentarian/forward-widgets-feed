@@ -6,5 +6,6 @@
 
 - 主线订阅：`https://raw.githubusercontent.com/Establishmentarian/forward-widgets-feed/main/tmdb-category-browser.js`
 - 版本订阅：`https://raw.githubusercontent.com/Establishmentarian/forward-widgets-feed/v0.6.21/tmdb-category-browser.js`
+- 版本文件订阅：`https://raw.githubusercontent.com/Establishmentarian/forward-widgets-feed/main/tmdb-category-browser-v0.6.21.js`
 
 源码仓库已与公开订阅出口分离。
