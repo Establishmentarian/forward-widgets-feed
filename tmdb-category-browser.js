@@ -404,83 +404,6 @@ function getCatalogSourcePageMultiplier(categoryId) {
   return CATALOG_SOURCE_PAGE_MULTIPLIERS[categoryId] ?? 1;
 }
 
-var WidgetMetadata = {
-  id: 'tmdb-category-browser',
-  title: 'TMDb 剧集/电影分类',
-  description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
-  version: "0.6.20",
-  requiredVersion: '0.0.1',
-  author: 'Codex',
-  modules: [
-    {
-      id: 'tmdb-category-browser',
-      title: '影视分类',
-      description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
-      functionName: 'browseTmdbCategories',
-      type: 'video',
-      cacheDuration: 1,
-      params: [
-        {
-          name: 'cache_rev',
-          title: '缓存版本',
-          description: '内部缓存刷新标记，用于让 Forward 客户端丢弃旧模块结果缓存。',
-          type: 'constant',
-          value: 'v0.6.20',
-        },
-        {
-          name: 'sort_by',
-          title: '排序方式',
-          type: 'enumeration',
-          value: 'date_desc',
-          enumOptions: SORT_OPTIONS,
-        },
-        {
-          name: 'category',
-          title: '分类',
-          type: 'enumeration',
-          value: 'chinese_movie',
-          enumOptions: CATEGORY_OPTIONS,
-        },
-        {
-          name: 'count',
-          title: '每页数量',
-          type: 'count',
-          value: '20',
-          placeholders: [
-            {
-              title: '10 条',
-              value: '10',
-            },
-            {
-              title: '20 条',
-              value: '20',
-            },
-            {
-              title: '40 条',
-              value: '40',
-            },
-            {
-              title: '60 条',
-              value: '60',
-            },
-          ],
-        },
-        {
-          name: 'page',
-          title: '页码',
-          type: 'page',
-          value: '1',
-        },
-      ],
-    },
-  ],
-};
-
-// 视频卡片统一走 Forward 原生 TMDb 链路，不再经过 Worker 目录代理或自定义详情封装。
-async function browseTmdbCategories(params) {
-  return browseCatalog(params);
-}
-
 function getDefaultTmdbGet() {
   if (typeof Widget === 'undefined' || !Widget?.tmdb?.get) {
     throw new Error('当前运行环境缺少 Widget.tmdb.get，无法请求 TMDb。');
@@ -577,6 +500,7 @@ const LEGACY_CACHE_KEY_PREFIXES = Object.freeze([
 ]);
 const CACHE_MAX_RECORDS = 1000;
 const TMDB_REQUEST_TIMEOUT_MS = 8000;
+const CACHE_IO_TIMEOUT_MS = 300;
 const CACHE_REFRESH_TIMEOUT_MS = 1500;
 const FIRST_PAGE_STALE_MAX_AGE_DAYS = 45;
 const INCREMENTAL_REFRESH_MAX_SOURCE_PAGES = 3;
@@ -585,9 +509,23 @@ const BACKFILL_INTERVAL_DAYS = 7;
 const BACKFILL_LOOKBACK_DAYS = 90;
 const BACKGROUND_PREFETCH_PAGES = 0;
 const SOURCE_PAGE_BATCH_SIZE = 4;
+const EXTRA_SOURCE_PAGE_LIMIT = 8;
 
 function buildImageUrl(size, path) {
   return isMeaningfulText(path) ? `${TMDB_IMAGE_BASE}/${size}${path}` : '';
+}
+
+function normalizeTmdbImageUrl(size, path) {
+  const normalizedPath = normalizeTitle(path);
+  if (!normalizedPath) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    return normalizedPath;
+  }
+
+  return normalizedPath.startsWith('/') ? buildImageUrl(size, normalizedPath) : normalizedPath;
 }
 
 function getRawTitle(item, mediaType) {
@@ -1001,10 +939,12 @@ async function fetchLocalizedDiscoverPage({
   const traditionalResponse = traditionalResult.status === 'fulfilled' ? traditionalResult.value : null;
 
   if (!simplifiedResponse && !traditionalResponse) {
-    // 单个远端窗口页失败不应拖垮整个分类墙；保留失败上下文，方便单测和运行日志定位是哪种语言失败。
+    // 单个远端窗口页失败不应立刻拖垮已有缓存场景；错误会上抛到窗口汇总层，
+    // 冷启动且所有窗口都失败时再转成可见错误，避免把鉴权/限流误报成“无数据”。
     return {
       results: [],
       totalPages: 0,
+      failed: true,
       errors: [
         {
           endpoint,
@@ -1022,7 +962,11 @@ async function fetchLocalizedDiscoverPage({
     };
   }
 
-  return mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse);
+  return {
+    ...mergeLocalizedResults(mediaType, simplifiedResponse, traditionalResponse),
+    failed: false,
+    errors: [],
+  };
 }
 
 const EXPLICIT_ADULT_PATTERNS = [
@@ -1108,19 +1052,33 @@ async function collectCatalogRecordsForScope({
   dateRange,
 }) {
   const collected = [];
+  const errors = [];
+  let attemptedPages = 0;
+  let failedPages = 0;
   let knownTotalPages = null;
+  const sourcePageLimit = dateRange
+    ? scope.requestedSourcePages
+    : scope.requestedSourcePages + Math.min(scope.requestedSourcePages, EXTRA_SOURCE_PAGE_LIMIT);
 
-  // 这里刻意按“固定窗口”取页：当前 Forward 页只绑定一段 TMDb 远端页，
-  // 不回扫历史页，也不为凑满数量继续补抓后续页。
+  // 当前 Forward 页从固定远端窗口起步，不回扫历史页；如果过滤后太稀疏，
+  // 只允许向后做小幅顺延补抓，防止页面直接空掉导致 Forward 误判没有下一页。
   // 同一窗口内按小批量并发抓取，避免一页一页串行等待导致冷启动过慢。
-  for (let offset = 0; offset < scope.requestedSourcePages;) {
+  for (let offset = 0; offset < sourcePageLimit;) {
+    if (offset >= scope.requestedSourcePages && collected.length >= params.count) {
+      break;
+    }
+
     const sourcePages = [];
 
     for (
       let batchOffset = 0;
-      batchOffset < SOURCE_PAGE_BATCH_SIZE && offset < scope.requestedSourcePages;
+      batchOffset < SOURCE_PAGE_BATCH_SIZE && offset < sourcePageLimit;
       batchOffset += 1, offset += 1
     ) {
+      if (offset >= scope.requestedSourcePages && collected.length >= params.count) {
+        break;
+      }
+
       const sourcePage = scope.startPage + offset;
       if (Number.isFinite(knownTotalPages) && sourcePage > knownTotalPages) {
         break;
@@ -1148,6 +1106,12 @@ async function collectCatalogRecordsForScope({
     );
 
     for (const localizedPage of localizedPages) {
+      attemptedPages += 1;
+      if (localizedPage.failed) {
+        failedPages += 1;
+        errors.push(...(localizedPage.errors ?? []));
+      }
+
       if (localizedPage.totalPages > 0) {
         knownTotalPages = localizedPage.totalPages;
       }
@@ -1174,7 +1138,12 @@ async function collectCatalogRecordsForScope({
     }
   }
 
-  return collected;
+  return {
+    records: collected,
+    attemptedPages,
+    failedPages,
+    errors,
+  };
 }
 
 async function collectCatalogRecords({ params, tmdbGet, todayDate, fetchPlan, sortKey, dateRange }) {
@@ -1203,8 +1172,11 @@ async function collectCatalogRecords({ params, tmdbGet, todayDate, fetchPlan, so
   );
 
   return {
-    records: dedupeCatalogRecords(scopeResults.flat()),
+    records: dedupeCatalogRecords(scopeResults.flatMap((result) => result.records)),
     categoryTitle: selectedScopes[0].rule.title,
+    attemptedPages: scopeResults.reduce((sum, result) => sum + result.attemptedPages, 0),
+    failedPages: scopeResults.reduce((sum, result) => sum + result.failedPages, 0),
+    errors: scopeResults.flatMap((result) => result.errors),
   };
 }
 
@@ -1442,8 +1414,8 @@ function normalizeCacheRecord(record) {
     adult: record.adult === true,
     voteCount: normalizeNumber(record.voteCount),
     voteAverage: normalizeNumber(record.voteAverage),
-    posterPath: normalizeTitle(record.posterPath || record.poster_path),
-    backdropPath: normalizeTitle(record.backdropPath || record.backdrop_path),
+    posterPath: normalizeTmdbImageUrl('w500', record.posterPath || record.poster_path),
+    backdropPath: normalizeTmdbImageUrl('w780', record.backdropPath || record.backdrop_path),
   };
 
   return isValidCacheRecord(normalizedRecord) ? normalizedRecord : null;
@@ -1526,13 +1498,25 @@ function normalizeCachedPages(rawPages) {
   return pages;
 }
 
-async function readCatalogCache(storage, categoryId, { keyPrefix = CACHE_KEY_PREFIX, allowLegacy = false } = {}) {
+async function readCatalogCache(
+  storage,
+  categoryId,
+  {
+    keyPrefix = CACHE_KEY_PREFIX,
+    allowLegacy = false,
+    ioTimeoutMs = CACHE_IO_TIMEOUT_MS,
+  } = {},
+) {
   if (!storage?.get) {
     return null;
   }
 
   try {
-    const rawValue = await storage.get(getCatalogCacheKey(categoryId, keyPrefix));
+    const rawValue = await withTimeout(
+      () => storage.get(getCatalogCacheKey(categoryId, keyPrefix)),
+      ioTimeoutMs,
+      `Widget.storage.get ${categoryId}`,
+    );
     if (!rawValue) {
       return null;
     }
@@ -1543,12 +1527,16 @@ async function readCatalogCache(storage, categoryId, { keyPrefix = CACHE_KEY_PRE
   }
 }
 
-async function readLegacyCatalogCache(storage, categoryId) {
-  for (const keyPrefix of LEGACY_CACHE_KEY_PREFIXES) {
-    const cache = await readCatalogCache(storage, categoryId, {
+async function readLegacyCatalogCache(storage, categoryId, { ioTimeoutMs = CACHE_IO_TIMEOUT_MS } = {}) {
+  const caches = await Promise.all(
+    LEGACY_CACHE_KEY_PREFIXES.map((keyPrefix) => readCatalogCache(storage, categoryId, {
       keyPrefix,
       allowLegacy: true,
-    });
+      ioTimeoutMs,
+    })),
+  );
+
+  for (const cache of caches) {
     if (cache?.records.length || Object.keys(cache?.pages ?? {}).length) {
       return cache;
     }
@@ -1557,13 +1545,17 @@ async function readLegacyCatalogCache(storage, categoryId) {
   return null;
 }
 
-async function writeCatalogCache(storage, cache) {
+async function writeCatalogCache(storage, cache, { ioTimeoutMs = CACHE_IO_TIMEOUT_MS } = {}) {
   if (!storage?.set || !cache) {
     return;
   }
 
   try {
-    await storage.set(getCatalogCacheKey(cache.categoryId), JSON.stringify(cache));
+    await withTimeout(
+      () => storage.set(getCatalogCacheKey(cache.categoryId), JSON.stringify(cache)),
+      ioTimeoutMs,
+      `Widget.storage.set ${cache.categoryId}`,
+    );
   } catch {
     // 缓存只是加速与兜底层，写入失败不能影响当前页面展示。
   }
@@ -1616,6 +1608,23 @@ function shiftDate(dateText, offsetDays) {
   return date.toISOString().slice(0, 10);
 }
 
+function withTimeout(taskFactory, timeoutMs, label) {
+  if (typeof setTimeout !== 'function' || typeof clearTimeout !== 'function') {
+    return taskFactory();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    Promise.resolve()
+      .then(taskFactory)
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer));
+  });
+}
+
 function createTimeoutTmdbGet(tmdbGet, timeoutMs = TMDB_REQUEST_TIMEOUT_MS) {
   return (pathName, options = {}) => {
     if (typeof setTimeout !== 'function' || typeof clearTimeout !== 'function') {
@@ -1660,7 +1669,12 @@ function sliceCurrentWindowRecords(records, params) {
 }
 
 async function fetchCurrentWindowRecords({ params, tmdbGet, todayDate }) {
-  const { records } = await collectCatalogRecords({
+  const {
+    records,
+    attemptedPages,
+    failedPages,
+    errors,
+  } = await collectCatalogRecords({
     params,
     tmdbGet,
     todayDate,
@@ -1672,13 +1686,26 @@ async function fetchCurrentWindowRecords({ params, tmdbGet, todayDate }) {
     records,
     responseRecords: sortedRecords.slice(0, params.count),
     cachePageRecords: sliceCurrentWindowRecords(records, params),
+    attemptedPages,
+    failedPages,
+    errors,
   };
 }
 
 function mapRecordsToVideoItems(records, categoryTitle) {
+  const seenItemIds = new Set();
+
   return records
     .filter(hasRenderablePoster)
-    .map((record) => mapRecordToVideoItem(record, categoryTitle));
+    .map((record) => mapRecordToVideoItem(record, categoryTitle))
+    .filter((item) => {
+      if (seenItemIds.has(item.id)) {
+        return false;
+      }
+
+      seenItemIds.add(item.id);
+      return true;
+    });
 }
 
 function getCategoryTitle(categoryId) {
@@ -1817,38 +1844,27 @@ function setCachedPageRecords(cache, sortKey, page, records) {
   };
 }
 
-function getNearestCachedPageRecords(cache, params, todayDate) {
-  const pagesByNumber = cache?.pages?.[params.sortKey];
-  if (!pagesByNumber || typeof pagesByNumber !== 'object') {
-    return [];
-  }
-
-  const pageNumbers = Object.keys(pagesByNumber)
-    .map((page) => coerceInteger(page, 0, { min: 1 }))
-    .filter(Boolean)
-    .sort((left, right) => left - right);
-
-  if (!pageNumbers.length) {
-    return [];
-  }
-
-  const previousPage = pageNumbers.filter((page) => page <= params.page).at(-1);
-  const fallbackPage = previousPage ?? pageNumbers[0];
-  const fallbackRecords = pagesByNumber[String(fallbackPage)] ?? [];
-
-  return sortCatalogRecords(
-    filterRecordsForResponse(fallbackRecords, params, todayDate),
-    params.sortKey,
-  ).slice(0, params.count);
-}
-
 function getCachedFallbackRecords(cache, params, todayDate) {
   const recordPoolPage = paginateCacheRecords(cache?.records ?? [], params, todayDate);
   if (recordPoolPage.length) {
     return recordPoolPage;
   }
 
-  return getNearestCachedPageRecords(cache, params, todayDate);
+  return [];
+}
+
+function didAllRemotePagesFail(fetchResult) {
+  return fetchResult.attemptedPages > 0 && fetchResult.failedPages === fetchResult.attemptedPages;
+}
+
+function buildRemoteFailureError(params, categoryTitle, fetchResult) {
+  const sample = fetchResult.errors
+    .slice(0, 3)
+    .map((error) => `${error.endpoint} ${error.language} p${error.page}: ${error.reason}`)
+    .join('；');
+  const details = sample ? `。示例：${sample}` : '';
+
+  return new Error(`TMDb 分类加载失败：${categoryTitle} 第 ${params.page} 页远端请求全部失败${details}`);
 }
 
 function startBackgroundRefresh(task, overrides) {
@@ -1910,11 +1926,12 @@ async function repairCachedPageFromRecords({ storage, cache, params, records }) 
 }
 
 async function fetchAndCacheCurrentWindow({ params, tmdbGet, storage, cache, todayDate }) {
-  const { records, responseRecords, cachePageRecords } = await fetchCurrentWindowRecords({
+  const fetchResult = await fetchCurrentWindowRecords({
     params,
     tmdbGet,
     todayDate,
   });
+  const { records, responseRecords, cachePageRecords } = fetchResult;
 
   if (!records.length) {
     return responseRecords;
@@ -2095,7 +2112,8 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   const storage = overrides.storage ?? getDefaultStorage();
   const todayDate = overrides.todayDate ?? getTodayDateString();
   const categoryTitle = getCategoryTitle(params.categoryId);
-  const cachedCatalog = await readCatalogCache(storage, params.categoryId);
+  const cacheIoTimeoutMs = overrides.cacheIoTimeoutMs ?? CACHE_IO_TIMEOUT_MS;
+  const cachedCatalog = await readCatalogCache(storage, params.categoryId, { ioTimeoutMs: cacheIoTimeoutMs });
   const cachedResponse = getCachedResponseRecords(cachedCatalog, params, todayDate);
 
   if (shouldRefreshCachedFirstPage(cachedCatalog, cachedResponse.records, params, todayDate)) {
@@ -2153,7 +2171,7 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
   }
 
   if (isPreviewPageRequest(params)) {
-    const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId);
+    const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId, { ioTimeoutMs: cacheIoTimeoutMs });
     const legacyFallbackRecords = getCachedFallbackRecords(legacyCachedCatalog, params, todayDate);
     if (legacyFallbackRecords.length) {
       const tmdbGet = createOptionalTimeoutTmdbGet(overrides);
@@ -2178,21 +2196,26 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
     overrides.tmdbGet ?? getDefaultTmdbGet(),
     overrides.tmdbTimeoutMs ?? TMDB_REQUEST_TIMEOUT_MS,
   );
-  const { records, responseRecords, cachePageRecords } = await fetchCurrentWindowRecords({
+  const fetchResult = await fetchCurrentWindowRecords({
     params,
     tmdbGet,
     todayDate,
   });
+  const { records, responseRecords, cachePageRecords } = fetchResult;
 
   if (!responseRecords.length) {
     let fallbackRecords = getCachedFallbackRecords(cachedCatalog, params, todayDate);
     if (!fallbackRecords.length) {
-      const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId);
+      const legacyCachedCatalog = await readLegacyCatalogCache(storage, params.categoryId, { ioTimeoutMs: cacheIoTimeoutMs });
       fallbackRecords = getCachedFallbackRecords(legacyCachedCatalog, params, todayDate);
     }
 
     if (fallbackRecords.length) {
       return mapRecordsToVideoItems(fallbackRecords, categoryTitle);
+    }
+
+    if (didAllRemotePagesFail(fetchResult)) {
+      throw buildRemoteFailureError(params, categoryTitle, fetchResult);
     }
   }
 
@@ -2203,8 +2226,416 @@ async function browseCatalog(rawParams = {}, overrides = {}) {
       lastSyncDate: todayDate,
       pages: setCachedPageRecords(cachedCatalog, params.sortKey, params.page, cachePageRecords),
       records: mergedRecords,
-    });
+    }, { ioTimeoutMs: cacheIoTimeoutMs });
   }
 
   return mapRecordsToVideoItems(responseRecords, categoryTitle);
+}
+
+const MP_DEFAULT_BASE_URL = 'http://192.168.31.2:3001';
+const MP_REQUEST_TIMEOUT_MS = 8000;
+
+const MP_MEDIA_TYPE_OPTIONS = Object.freeze([
+  { title: '全部', value: 'all' },
+  { title: '电影', value: MEDIA_TYPES.MOVIE },
+  { title: '剧集', value: MEDIA_TYPES.TV },
+]);
+
+const MP_SORT_OPTIONS = Object.freeze([
+  { title: '最近订阅', value: 'date_desc' },
+  { title: '最近更新', value: 'updated_desc' },
+  { title: '标题', value: 'title_asc' },
+]);
+
+function mpNormalizeText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function mpCoerceInteger(value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(parsed, min), max);
+}
+
+function mpPickValue(value, options, fallback) {
+  const validValues = new Set(options.map((option) => option.value));
+  return validValues.has(value) ? value : fallback;
+}
+
+function mpNormalizeBaseUrl(value) {
+  const normalized = mpNormalizeText(value) || MP_DEFAULT_BASE_URL;
+  return normalized.replace(/\/+$/, '');
+}
+
+function mpNormalizeImageUrl(path) {
+  const normalizedPath = mpNormalizeText(path);
+  if (!normalizedPath) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    return normalizedPath;
+  }
+
+  return normalizedPath.startsWith('/') ? `${TMDB_IMAGE_BASE}/w500${normalizedPath}` : normalizedPath;
+}
+
+function mpNormalizeBackdropUrl(path) {
+  const normalizedPath = mpNormalizeText(path);
+  if (!normalizedPath) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    return normalizedPath;
+  }
+
+  return normalizedPath.startsWith('/') ? `${TMDB_IMAGE_BASE}/w780${normalizedPath}` : normalizedPath;
+}
+
+function mpNormalizeMediaType(value) {
+  const normalized = mpNormalizeText(value).toLowerCase();
+
+  if (normalized === MEDIA_TYPES.MOVIE || normalized === '电影' || normalized === 'movie') {
+    return MEDIA_TYPES.MOVIE;
+  }
+
+  if (
+    normalized === MEDIA_TYPES.TV ||
+    normalized === '电视剧' ||
+    normalized === '剧集' ||
+    normalized === 'tv' ||
+    normalized === 'series'
+  ) {
+    return MEDIA_TYPES.TV;
+  }
+
+  return '';
+}
+
+function mpParseTmdbId(rawSubscribe) {
+  const directTmdbId = mpCoerceInteger(rawSubscribe?.tmdbid ?? rawSubscribe?.tmdb_id, 0, { min: 0 });
+  if (directTmdbId) {
+    return directTmdbId;
+  }
+
+  const mediaId = mpNormalizeText(rawSubscribe?.mediaid ?? rawSubscribe?.media_id);
+  const matched = mediaId.match(/(?:tmdb|movie|tv)[:.](\d+)/i);
+  return matched ? mpCoerceInteger(matched[1], 0, { min: 0 }) : 0;
+}
+
+function mpGetDefaultHttpGet() {
+  if (typeof Widget === 'undefined' || !Widget?.http?.get) {
+    throw new Error('当前运行环境缺少 Widget.http.get，无法请求 MoviePilot。');
+  }
+
+  return Widget.http.get.bind(Widget.http);
+}
+
+function mpWithTimeout(taskFactory, timeoutMs, label) {
+  if (typeof setTimeout !== 'function' || typeof clearTimeout !== 'function') {
+    return taskFactory();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    Promise.resolve()
+      .then(taskFactory)
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer));
+  });
+}
+
+function normalizeMoviePilotParams(params = {}) {
+  return {
+    baseUrl: mpNormalizeBaseUrl(params.mp_base_url),
+    apiToken: mpNormalizeText(params.api_token),
+    mediaType: mpPickValue(params.media_type, MP_MEDIA_TYPE_OPTIONS, 'all'),
+    sortKey: mpPickValue(params.sort_by, MP_SORT_OPTIONS, 'date_desc'),
+    count: mpCoerceInteger(params.count, DEFAULT_COUNT, { min: 1, max: MAX_COUNT }),
+    page: mpCoerceInteger(params.page, DEFAULT_PAGE, { min: 1 }),
+  };
+}
+
+function normalizeMoviePilotSubscribe(rawSubscribe) {
+  const tmdbId = mpParseTmdbId(rawSubscribe);
+  const mediaType = mpNormalizeMediaType(rawSubscribe?.type);
+
+  if (!tmdbId || !mediaType) {
+    return null;
+  }
+
+  const title = mpNormalizeText(rawSubscribe?.name || rawSubscribe?.title || rawSubscribe?.keyword);
+  if (!title) {
+    return null;
+  }
+
+  return {
+    id: mpCoerceInteger(rawSubscribe?.id, tmdbId, { min: 1 }),
+    tmdbId,
+    mediaType,
+    title,
+    year: mpNormalizeText(rawSubscribe?.year),
+    season: mpCoerceInteger(rawSubscribe?.season, 0, { min: 0 }),
+    posterPath: mpNormalizeImageUrl(rawSubscribe?.poster),
+    backdropPath: mpNormalizeBackdropUrl(rawSubscribe?.backdrop),
+    description: mpNormalizeText(rawSubscribe?.description),
+    rating: Number.isFinite(rawSubscribe?.vote) ? rawSubscribe.vote : 0,
+    date: mpNormalizeText(rawSubscribe?.date),
+    lastUpdate: mpNormalizeText(rawSubscribe?.last_update),
+    totalEpisode: mpCoerceInteger(rawSubscribe?.total_episode, 0, { min: 0 }),
+    lackEpisode: mpCoerceInteger(rawSubscribe?.lack_episode, 0, { min: 0 }),
+    state: mpNormalizeText(rawSubscribe?.state),
+    mediaCategory: mpNormalizeText(rawSubscribe?.media_category),
+  };
+}
+
+function sortMoviePilotSubscribes(records, sortKey) {
+  const sorted = [...records];
+
+  sorted.sort((left, right) => {
+    switch (sortKey) {
+      case 'updated_desc':
+        return (
+          right.lastUpdate.localeCompare(left.lastUpdate) ||
+          right.date.localeCompare(left.date) ||
+          left.title.localeCompare(right.title, 'zh-Hans-CN')
+        );
+      case 'title_asc':
+        return left.title.localeCompare(right.title, 'zh-Hans-CN') || right.date.localeCompare(left.date);
+      case 'date_desc':
+      default:
+        return (
+          right.date.localeCompare(left.date) ||
+          right.lastUpdate.localeCompare(left.lastUpdate) ||
+          left.title.localeCompare(right.title, 'zh-Hans-CN')
+        );
+    }
+  });
+
+  return sorted;
+}
+
+function buildMoviePilotDescription(record) {
+  const meta = [
+    record.year,
+    record.mediaType === MEDIA_TYPES.TV && record.season ? `第 ${record.season} 季` : '',
+    record.totalEpisode ? `${record.totalEpisode} 集` : '',
+    record.lackEpisode ? `缺 ${record.lackEpisode} 集` : '',
+    record.state,
+  ].filter(Boolean);
+  const body = record.description || 'MoviePilot 订阅';
+
+  return [meta.join(' · '), body].filter(Boolean).join('\n');
+}
+
+function mapMoviePilotSubscribeToVideoItem(record) {
+  return {
+    id: String(record.tmdbId),
+    tmdbId: record.tmdbId,
+    type: 'tmdb',
+    title: record.year ? `${record.title} (${record.year})` : record.title,
+    subTitle: '',
+    posterPath: record.posterPath,
+    backdropPath: record.backdropPath,
+    releaseDate: record.date || record.lastUpdate || undefined,
+    mediaType: record.mediaType,
+    genreTitle: record.mediaCategory || (record.mediaType === MEDIA_TYPES.TV ? 'MP 订阅剧集' : 'MP 订阅电影'),
+    description: buildMoviePilotDescription(record),
+    rating: record.rating,
+  };
+}
+
+async function fetchMoviePilotSubscribes(params, httpGet) {
+  if (!params.apiToken) {
+    throw new Error('缺少 MoviePilot API_TOKEN，请在模块参数 api_token 中填写。');
+  }
+
+  const response = await mpWithTimeout(
+    () => httpGet(`${params.baseUrl}/api/v1/subscribe/list`, {
+      params: {
+        token: params.apiToken,
+      },
+    }),
+    MP_REQUEST_TIMEOUT_MS,
+    'MoviePilot subscribe/list',
+  );
+
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`MoviePilot 订阅接口返回 HTTP ${response.statusCode}`);
+  }
+
+  if (!Array.isArray(response.data)) {
+    throw new Error('MoviePilot 订阅接口返回格式不是数组。');
+  }
+
+  return response.data;
+}
+
+async function browseMoviePilotSubscriptions(rawParams = {}, overrides = {}) {
+  const params = normalizeMoviePilotParams(rawParams);
+  const httpGet = overrides.httpGet ?? mpGetDefaultHttpGet();
+  const rawSubscribes = await fetchMoviePilotSubscribes(params, httpGet);
+  const records = rawSubscribes
+    .map((item) => normalizeMoviePilotSubscribe(item))
+    .filter(Boolean)
+    .filter((item) => params.mediaType === 'all' || item.mediaType === params.mediaType);
+  const sortedRecords = sortMoviePilotSubscribes(records, params.sortKey);
+  const startIndex = (params.page - 1) * params.count;
+
+  return sortedRecords
+    .slice(startIndex, startIndex + params.count)
+    .map((record) => mapMoviePilotSubscribeToVideoItem(record));
+}
+
+var WidgetMetadata = {
+  id: 'tmdb-category-browser',
+  title: 'TMDb 剧集/电影分类',
+  description: '纯 TMDb 直连分类墙，只保留 TMDb 分类列表、双语混抓、过滤、排序与分页。',
+  version: "0.6.21",
+  requiredVersion: '0.0.1',
+  author: 'Codex',
+  modules: [
+    {
+      id: 'tmdb-category-browser',
+      title: '影视分类',
+      description: '纯 TMDb 分类墙，不含翻译代理、目录代理与自定义详情链路。',
+      functionName: 'browseTmdbCategories',
+      type: 'video',
+      cacheDuration: 1,
+      params: [
+        {
+          name: 'cache_rev',
+          title: '缓存版本',
+          description: '内部缓存刷新标记，用于让 Forward 客户端丢弃旧模块结果缓存。',
+          type: 'constant',
+          value: 'v0.6.21',
+        },
+        {
+          name: 'sort_by',
+          title: '排序方式',
+          type: 'enumeration',
+          value: 'date_desc',
+          enumOptions: SORT_OPTIONS,
+        },
+        {
+          name: 'category',
+          title: '分类',
+          type: 'enumeration',
+          value: 'chinese_movie',
+          enumOptions: CATEGORY_OPTIONS,
+        },
+        {
+          name: 'count',
+          title: '每页数量',
+          type: 'count',
+          value: '20',
+          placeholders: [
+            {
+              title: '10 条',
+              value: '10',
+            },
+            {
+              title: '20 条',
+              value: '20',
+            },
+            {
+              title: '40 条',
+              value: '40',
+            },
+            {
+              title: '60 条',
+              value: '60',
+            },
+          ],
+        },
+        {
+          name: 'page',
+          title: '页码',
+          type: 'page',
+          value: '1',
+        },
+      ],
+    },
+    {
+      id: 'moviepilot-subscriptions',
+      title: 'MoviePilot 订阅',
+      description: '读取本机 MoviePilot 的订阅列表，订阅后在 Forward 中按原生 TMDb 卡片展示。',
+      functionName: 'browseMoviePilotSubscriptions',
+      type: 'video',
+      cacheDuration: 60,
+      params: [
+        {
+          name: 'mp_base_url',
+          title: 'MP 地址',
+          description: 'MoviePilot 后端地址。手机或平板访问时请填写 Mac 的局域网地址。',
+          type: 'input',
+          value: 'http://192.168.31.2:3001',
+        },
+        {
+          name: 'api_token',
+          title: 'API_TOKEN',
+          description: 'MoviePilot API_TOKEN。只用于请求 /api/v1/subscribe/list。',
+          type: 'input',
+          value: '',
+        },
+        {
+          name: 'media_type',
+          title: '类型',
+          type: 'enumeration',
+          value: 'all',
+          enumOptions: MP_MEDIA_TYPE_OPTIONS,
+        },
+        {
+          name: 'sort_by',
+          title: '排序方式',
+          type: 'enumeration',
+          value: 'date_desc',
+          enumOptions: MP_SORT_OPTIONS,
+        },
+        {
+          name: 'count',
+          title: '每页数量',
+          type: 'count',
+          value: '20',
+          placeholders: [
+            {
+              title: '10 条',
+              value: '10',
+            },
+            {
+              title: '20 条',
+              value: '20',
+            },
+            {
+              title: '40 条',
+              value: '40',
+            },
+            {
+              title: '60 条',
+              value: '60',
+            },
+          ],
+        },
+        {
+          name: 'page',
+          title: '页码',
+          type: 'page',
+          value: '1',
+        },
+      ],
+    },
+  ],
+};
+
+// 视频卡片统一走 Forward 原生 TMDb 链路，不再经过 Worker 目录代理或自定义详情封装。
+async function browseTmdbCategories(params) {
+  return browseCatalog(params);
 }
